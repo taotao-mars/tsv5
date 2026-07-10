@@ -942,7 +942,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  peak_cross_attn_scale=0.05,
                  use_enn=True,
                  z_dim=8,
-                 residual_scale=2.0,
+                 residual_scale=1.7,
                  gate_temperature=1.0):
         super().__init__()
         self.horizon = horizon
@@ -1555,7 +1555,7 @@ class ExposureForecastModelV2(nn.Module):
     def __init__(self, input_dim, context_dim,
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
-                 use_enn=True, z_dim=8, residual_scale=2.0,
+                 use_enn=True, z_dim=8, residual_scale=1.7,
                  ratio_residual_scale=0.50,
                  zero_protect_enabled=True,
                  zero_protect_threshold=0.35,
@@ -2974,6 +2974,7 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     zero_protect_enabled=True,
     zero_protect_threshold=0.35,
@@ -3018,6 +3019,7 @@ def run_exposure_v2(
         n_heads=n_heads,
         dropout=dropout,
         context_cols=context_cols,
+        residual_scale=residual_scale,
         ratio_residual_scale=ratio_residual_scale,
         zero_protect_enabled=zero_protect_enabled,
         zero_protect_threshold=zero_protect_threshold,
@@ -3074,35 +3076,6 @@ def run_exposure_v2(
         "data": data,
     }
 
-
-# ============================================================
-# 使用
-# ============================================================
-#
-# result = run_exposure_v2(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=13,
-#     horizon=20,
-#     d_model=64,
-#     n_heads=4,
-#     batch_size=64,
-#     epochs=60,
-#     lr=1e-3,
-#     patience=8,
-#     anchor_decay=0.08,     # anchor衰减速度，越大远期越快收缩到mean13
-#     bce_weight=1.00,       # occurrence BCE loss权重
-#     mag_weight=1.00,       # magnitude Huber loss权重
-#     mean_weight=0.50,      # mean scale penalty权重
-# )
-#
-# exposure_hat_for_demand = result["exposure_hat_for_demand"]
-# pred_df = result["forecast_df"]
-#
-# # 诊断occurrence预测质量
-# print(pred_df.groupby("horizon")["p_active_instock"].mean())
 
 # ============================================================
 # Rolling Backtest + SCOT Intersection Add-on
@@ -3350,6 +3323,7 @@ def _train_one_exposure_window(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     zero_protect_enabled=True,
     zero_protect_threshold=0.35,
@@ -3400,6 +3374,7 @@ def _train_one_exposure_window(
         n_heads=n_heads,
         dropout=dropout,
         context_cols=context_cols,
+        residual_scale=residual_scale,
         ratio_residual_scale=ratio_residual_scale,
         zero_protect_enabled=zero_protect_enabled,
         zero_protect_threshold=zero_protect_threshold,
@@ -3412,6 +3387,7 @@ def _train_one_exposure_window(
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"Total calibration | residual_scale={residual_scale:.3f} | peak_delta_scale={getattr(model.decoder, 'peak_delta_scale', float('nan')):.3f}")
 
     print(
         "Zero loss weights | "
@@ -3510,6 +3486,7 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     zero_protect_enabled=True,
     zero_protect_threshold=0.35,
@@ -3571,6 +3548,7 @@ def run_exposure_v2(
         peak_under_weight=peak_under_weight,
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
+        residual_scale=residual_scale,
         ratio_residual_scale=ratio_residual_scale,
         zero_protect_enabled=zero_protect_enabled,
         zero_protect_threshold=zero_protect_threshold,
@@ -3640,6 +3618,7 @@ def run_exposure_v2_rolling(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
@@ -3965,6 +3944,7 @@ def apply_exposure_hat_variant_for_demand(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
@@ -4074,6 +4054,7 @@ def save_exposure_hat_for_demand_csv(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
@@ -4192,6 +4173,7 @@ def run_exposure_v2_final_scot_5000(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
+    residual_scale=1.7,
     ratio_residual_scale=0.50,
     zero_protect_enabled=True,
     zero_protect_threshold=0.35,
@@ -4224,6 +4206,7 @@ def run_exposure_v2_final_scot_5000(
         use_scot_intersection=True,
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
+        residual_scale=residual_scale,
         ratio_residual_scale=ratio_residual_scale,
         zero_protect_enabled=zero_protect_enabled,
         zero_protect_threshold=zero_protect_threshold,
@@ -4245,72 +4228,6 @@ def run_exposure_v2_final_scot_5000(
         )
     return result
 
-# ============================================================
-# Usage
-# ============================================================
-# Final setup: 5000 sample + SCOT intersection + latest 20-week holdout.
-# This AUTOSAVE version saves default CSV to: exposure_hat_for_demand.csv
-# Training samples are sliding windows; validation/test is the final 20-week window.
-#
-# %run -i tcn_exposure_v2_single_head_direct_gl_diag.py
-#
-# result = run_exposure_v2_final_scot_5000(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     history=13,
-#     horizon=20,
-#     epochs=30,
-#     patience=6,
-#     batch_size=128,
-#     use_encoder_self_attn=True,
-# )
-#
-# pred_df = result["forecast_df"]
-# exposure_hat_for_demand = result["exposure_hat_for_demand"]
-# diagnostics = result["diagnostics"]
-# gl_diag = result["gl_diagnostics"]
-# gl_block_diag = result["gl_horizon_block_diagnostics"]
-# gl_summary = result["gl_summary"]
-#
-# Optional no-attention ablation:
-# result_no_attn = run_exposure_v2_final_scot_5000(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     history=13,
-#     horizon=20,
-#     epochs=30,
-#     patience=6,
-#     batch_size=128,
-#     use_encoder_self_attn=False,
-# )
-#
-# Rolling backtest is still available for robustness checks:
-# result_roll = run_exposure_v2_rolling(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     history=13,
-#     horizon=20,
-#     rolling_offsets=(60, 40, 20, 0),
-#     epochs=20,
-#     patience=5,
-#     batch_size=128,
-#     use_scot_intersection=True,
-#     use_encoder_self_attn=True,
-# )
-
-
-# ============================================================
-# PACKAGE-AWARE ASIN RELATION GRAPH CONTEXT + KNOWN PROMO + GRAPH-HEAD-FUSION PATCH
-# Added by ChatGPT: package-comparable peer graph features.
-# v22: graph is no longer only side context; it is projected, fused with encoder/cross-attn state,
-#      and passed directly to final active/direct heads together with ENN latent z.
-# v23: add SPADE-style decoder-side peak residual branch driven by known future promo/holiday/event features.
-# Design:
-#   - graph neighbors = same category_code + relaxed package-size/weight comparable
-#   - graph features are computed at forecast origin from historical values only
-#   - future target weeks are never used to construct graph context
-#   - features are injected into future_context so encoder/decoder/z can use them
 # ============================================================
 
 GRAPH_CONTEXT_COLS = [
@@ -4879,7 +4796,25 @@ def summarize_graph_context_from_result(exposure_result):
     print("n_graph_cols:", len(present), "| context_dim:", len(cols))
     return {"graph_cols": present, "n_graph_cols": len(present), "context_dim": len(cols)}
 
-# Usage:
-# %run -i tcn_exposure_v2_enn_regime_singlehead_nogate_peakloss_gpu_GRAPH_PKG_PEER_v20.py
-# exposure_result = run_exposure_v2_final_scot_5000(data_raw1=data_raw1, scot_df=scot_df, history=13, horizon=20, epochs=30, patience=6, batch_size=128)
+# ============================================================
+# FINAL USAGE (only recommended entry point)
+# ============================================================
+# %run -i tcn_exposure_v2_v27_8e_RESIDUAL17_CLEANUSAGE.py
+#
+# exposure_result = run_exposure_v2_final_scot_5000(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     history=13,
+#     horizon=20,
+#     epochs=30,
+#     patience=6,
+#     batch_size=128,
+#     residual_scale=1.7,
+#     use_encoder_self_attn=True,
+#     save_hat_csv_path="exposure_hat_for_demand.csv",
+# )
+#
+# pred_df = exposure_result["forecast_df"]
+# exposure_hat_for_demand = exposure_result["exposure_hat_for_demand"]
+# diagnostics = exposure_result["diagnostics"]
 # graph_ctx_summary = summarize_graph_context_from_result(exposure_result)
