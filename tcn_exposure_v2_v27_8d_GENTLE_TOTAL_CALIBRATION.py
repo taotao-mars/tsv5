@@ -1718,7 +1718,6 @@ def exposure_hurdle_loss(
     zero_fp_temperature=20.0,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
-    total_over_mean_weight=0.04,
 ):
     """
     Single-head direct exposure loss with channel-specific zero awareness.
@@ -1804,13 +1803,6 @@ def exposure_hurdle_loss(
     mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
-
-    # 4a) v27.8d gentle one-sided total calibration.
-    # Only penalize total_dph when its horizon-level mean is above the truth.
-    # Underprediction receives no extra penalty here, so peak protection is preserved.
-    pred_total_h_mean_log = torch.log1p(pred_level[..., 0].mean(dim=0).clamp_min(1e-6))
-    true_total_h_mean_log = torch.log1p(true[..., 0].mean(dim=0).clamp_min(1e-6))
-    total_over_mean_loss = F.relu(pred_total_h_mean_log - true_total_h_mean_log).mean()
 
     # 4b) v27.4 ratio calibration for the hierarchical child channels.
     # When total is accurate but buy_box/in_stock are systematically high, the error
@@ -1925,7 +1917,6 @@ def exposure_hurdle_loss(
         + peak_under_weight * peak_under_loss
         + ratio_mean_weight * ratio_mean_loss
         + active_mean_weight * active_mean_loss
-        + total_over_mean_weight * total_over_mean_loss
     )
 
 # ============================================================
@@ -1958,13 +1949,12 @@ def train_exposure_model_v2(
     zero_fp_temperature=20.0,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
-    total_over_mean_weight=0.04,
     device=None,
 ):
     device = get_device(device)
     model = model.to(device)
     print(f"Training on device: {device}")
-    print(f"v27.8d gentle total calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight} | total_over_mean_weight={total_over_mean_weight}")
+    print(f"v27.4 ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
@@ -2009,7 +1999,6 @@ def train_exposure_model_v2(
                 zero_fp_temperature=zero_fp_temperature,
                 ratio_mean_weight=ratio_mean_weight,
                 active_mean_weight=active_mean_weight,
-                total_over_mean_weight=total_over_mean_weight,
             )
             opt.zero_grad()
             loss.backward()
@@ -3424,6 +3413,15 @@ def _train_one_exposure_window(
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
+    print(
+        "Zero loss weights | "
+        f"total={total_zero_weight} | "
+        f"buy={buy_zero_weight} | "
+        f"instock={instock_zero_weight} | "
+        f"total_consistency={total_zero_consistency_weight} | "
+        f"buy_consistency={buy_zero_consistency_weight}"
+    )
+
     train_exposure_model_v2(
         model=model,
         tr_ld=tr_ld,
@@ -3436,7 +3434,11 @@ def _train_one_exposure_window(
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
         zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
         total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
