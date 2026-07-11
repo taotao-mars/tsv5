@@ -2607,7 +2607,8 @@ def print_exposure_diagnostics(pred_df):
 
     # ── ASIN级别诊断 ─────────────────────────────────────────
     print("\n" + "=" * 100)
-    print("ASIN-LEVEL 20-WEEK SUM")
+    n_horizons = int(pred_df["horizon"].nunique())
+    print(f"ASIN-LEVEL {n_horizons}-WEEK SUM")
     print("=" * 100)
     asin_sum = pred_df.groupby("asin").agg(
         true_sum=("true_instock_dph", "sum"),
@@ -2624,16 +2625,21 @@ def print_exposure_diagnostics(pred_df):
     print("\n" + "=" * 100)
     print("QUICK JUDGMENT")
     print("=" * 100)
-    h1  = by_h[by_h["horizon"] == 1].iloc[0]
-    h20 = by_h[by_h["horizon"] == 20].iloc[0]
-    print(f"h=1  ratio={h1['ratio']:.3f}  WAPE={h1['WAPE']:.3f}  AUC={h1['active_AUC']:.3f}")
-    print(f"h=20 ratio={h20['ratio']:.3f}  WAPE={h20['WAPE']:.3f}  AUC={h20['active_AUC']:.3f}")
-    print(f"AUC drop h1→h20: {h1['active_AUC'] - h20['active_AUC']:.3f}  (target < 0.20)")
-    ratio_ok  = 0.85 <= h20["ratio"] <= 1.15
-    auc_ok    = h20["active_AUC"] >= 0.70
-    drop_ok   = (h1["active_AUC"] - h20["active_AUC"]) < 0.20
-    print(f"\nh=20 ratio in [0.85,1.15]: {'✅' if ratio_ok else '❌'}")
-    print(f"h=20 AUC >= 0.70:          {'✅' if auc_ok else '❌'}")
+    if by_h.empty:
+        raise ValueError("No horizon diagnostics available in by_h.")
+    by_h = by_h.sort_values("horizon").reset_index(drop=True)
+    h_first = by_h.iloc[0]
+    h_last = by_h.iloc[-1]
+    first_h = int(h_first["horizon"])
+    last_h = int(h_last["horizon"])
+    print(f"h={first_h} ratio={h_first['ratio']:.3f}  WAPE={h_first['WAPE']:.3f}  AUC={h_first['active_AUC']:.3f}")
+    print(f"h={last_h} ratio={h_last['ratio']:.3f}  WAPE={h_last['WAPE']:.3f}  AUC={h_last['active_AUC']:.3f}")
+    print(f"AUC drop h{first_h}→h{last_h}: {h_first['active_AUC'] - h_last['active_AUC']:.3f}  (target < 0.20)")
+    ratio_ok  = 0.85 <= h_last["ratio"] <= 1.15
+    auc_ok    = h_last["active_AUC"] >= 0.70
+    drop_ok   = (h_first["active_AUC"] - h_last["active_AUC"]) < 0.20
+    print(f"\nh={last_h} ratio in [0.85,1.15]: {'✅' if ratio_ok else '❌'}")
+    print(f"h={last_h} AUC >= 0.70:          {'✅' if auc_ok else '❌'}")
     print(f"AUC drop < 0.20:           {'✅' if drop_ok else '❌'}")
 
     # ── Final compact summary table ─────────────────────────
@@ -2651,19 +2657,19 @@ def print_exposure_diagnostics(pred_df):
         "note": "model overall",
     })
     final_rows.append({
-        "section": "h1_instock",
-        "ratio": h1["ratio"],
-        "WAPE": h1["WAPE"],
-        "corr": h1["corr"],
-        "active_AUC": h1["active_AUC"],
+        "section": f"h{first_h}_instock",
+        "ratio": h_first["ratio"],
+        "WAPE": h_first["WAPE"],
+        "corr": h_first["corr"],
+        "active_AUC": h_first["active_AUC"],
         "note": "short horizon",
     })
     final_rows.append({
-        "section": "h20_instock",
-        "ratio": h20["ratio"],
-        "WAPE": h20["WAPE"],
-        "corr": h20["corr"],
-        "active_AUC": h20["active_AUC"],
+        "section": f"h{last_h}_instock",
+        "ratio": h_last["ratio"],
+        "WAPE": h_last["WAPE"],
+        "corr": h_last["corr"],
+        "active_AUC": h_last["active_AUC"],
         "note": "long horizon",
     })
     if "p_active_instock" in pred_df.columns:
@@ -4562,7 +4568,7 @@ def diagnose_promo_adjusted_rank(pred_df, target="in_stock"):
         active_weeks=(true_col, lambda x: int(np.sum(np.asarray(x) > 0))),
     ).reset_index()
     asin["ratio"] = asin["pred_sum"] / (asin["true_sum"] + 1e-8)
-    asin["asin_20w_wape"] = (asin["pred_sum"] - asin["true_sum"]).abs() / (asin["true_sum"] + 1e-8)
+    asin["asin_window_wape"] = (asin["pred_sum"] - asin["true_sum"]).abs() / (asin["true_sum"] + 1e-8)
     asin["rank_bucket"] = _bucketize_rank(asin["avg_adjusted_rank"], n_bins=5)
     asin_rows = []
     for b, g in asin.groupby("rank_bucket"):
@@ -4577,8 +4583,8 @@ def diagnose_promo_adjusted_rank(pred_df, target="in_stock"):
             "pred_sum_mean": float(g["pred_sum"].mean()),
             "ratio": float(np.mean(pp) / (np.mean(yy) + 1e-8)),
             "aggregate_WAPE": float(_wape(yy, pp)),
-            "median_ASIN_WAPE": float(g["asin_20w_wape"].median()),
-            "p90_ASIN_WAPE": float(g["asin_20w_wape"].quantile(0.90)),
+            "median_ASIN_WAPE": float(g["asin_window_wape"].median()),
+            "p90_ASIN_WAPE": float(g["asin_window_wape"].quantile(0.90)),
         })
     asin_bucket_df = pd.DataFrame(asin_rows).sort_values("rank_bucket") if asin_rows else pd.DataFrame()
 
@@ -4594,7 +4600,8 @@ def diagnose_promo_adjusted_rank(pred_df, target="in_stock"):
     else:
         print("No bucket table available.")
 
-    print("\nASIN-LEVEL 20-WEEK WAPE BY AVG PROMO-ADJUSTED RANK")
+    n_horizons_rank = int(df["horizon"].nunique()) if "horizon" in df.columns else 0
+    print(f"\nASIN-LEVEL {n_horizons_rank}-WEEK WAPE BY AVG PROMO-ADJUSTED RANK")
     if len(asin_bucket_df):
         print(asin_bucket_df.round(4).to_string(index=False))
     else:
