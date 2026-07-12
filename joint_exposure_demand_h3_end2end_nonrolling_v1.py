@@ -4645,7 +4645,8 @@ def run_joint_exposure_demand_h3_end2end(
     detach_exposure_for_demand=False,
     remove_extreme=True,
     extreme_q=0.99,
-    output_csv="joint_exposure_demand_h3_forecast_real_scot_fixed.csv",
+    output_csv="joint_exposure_demand_h3_forecast_two_step_wape_aligned.csv",
+    remove_oos_dp=True,
 ):
     """Run non-rolling H3 joint model on one snapshot.
 
@@ -4656,7 +4657,7 @@ def run_joint_exposure_demand_h3_end2end(
         raise ValueError("Use horizon=3 for this file.")
 
     print("=" * 88)
-    print("JOINT EXPOSURE + DEMAND H3 END-TO-END V1.1 | NON-ROLLING | REAL SCOT ALIGNED")
+    print("JOINT EXPOSURE + DEMAND H3 END-TO-END V1.2 | TWO-STEP WAPE-ALIGNED")
     print("Shared encoder: YES | Separate decoders: YES")
     print(f"Demand gradient through exposure_hat: {not detach_exposure_for_demand}")
     print("=" * 88)
@@ -4676,7 +4677,17 @@ def run_joint_exposure_demand_h3_end2end(
         intersect_asin_df = sample_asin_df.copy()
 
     data_small, asin_stats = add_zero_rate_group(data_small_raw, (0.4, 0.7))
-    data_use = data_small[data_small["zero_group"] == "high_sparse"].copy()
+    # Match the two-step H3 demand model exactly:
+    # zero_group is diagnostic only; do not filter to high_sparse.
+    data_use = data_small.copy()
+    print("\n" + "=" * 80)
+    print("JOINT COHORT MATCHED TO TWO-STEP H3")
+    print("=" * 80)
+    print("Sampled ASINs:", len(sample_asin_df))
+    print("ASINs after SCOT intersection:", len(intersect_asin_df))
+    print("ASINs before extreme filtering:", data_use["asin"].nunique())
+    print("Sparse groups are diagnostics only; no high_sparse-only filtering.")
+
     if remove_extreme:
         data_use, removed_extreme, extreme_cap = filter_extreme_asins(data_use, q=extreme_q)
     else:
@@ -4716,6 +4727,7 @@ def run_joint_exposure_demand_h3_end2end(
     )
 
     forecast_df = generate_joint_forecast_df(model, va_ld, M=M_eval)
+    forecast_df["zero_group_run"] = "all_sample_scot_intersection"
     forecast_df.to_csv(output_csv, index=False)
     exposure_metrics = _joint_exposure_metrics(forecast_df)
 
@@ -4747,8 +4759,11 @@ def run_joint_exposure_demand_h3_end2end(
         "extreme_cap": extreme_cap,
     }
 
-    # Align against the real SCOT forecast file using the same ASIN/week keys
-    # and the same H1-H3 evaluation window as the standalone demand model.
+    # Use the exact WAPE evaluator copied from the standalone two-step H3 model.
+    # Cohort and evaluation order now match:
+    # sample 5000 -> SCOT intersection -> all sparse groups -> same extreme filter
+    # -> H1-H3 validation rows -> same OOS-DP filter -> same real-SCOT join
+    # -> same quick_error_check WAPE calculation.
     if scot_df is not None:
         try:
             result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
@@ -4756,7 +4771,7 @@ def run_joint_exposure_demand_h3_end2end(
                 scot_df=scot_df,
                 data_raw1=data_raw1,
                 asin_stats=asin_stats,
-                remove_oos_dp=True,
+                remove_oos_dp=remove_oos_dp,
                 source="lp",
             )
             result["final_wape"] = result["real_scot_outputs"]
@@ -4779,5 +4794,5 @@ def run_joint_exposure_demand_h3_end2end(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,  # true end-to-end
-#     output_csv="joint_exposure_demand_h3_forecast_real_scot_fixed.csv",
+#     output_csv="joint_exposure_demand_h3_forecast_two_step_wape_aligned.csv",
 # )
