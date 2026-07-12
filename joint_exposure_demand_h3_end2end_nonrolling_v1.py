@@ -1774,9 +1774,6 @@ def generate_forecast_df(model, va_ld, M=50):
                 M=M,
                 return_stock=True,
             )
-            hist_mean = (b["x"][:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
-            hm50 = hist_mean.expand_as(b["y"])
-            hm70 = hm50 * 1.25
             for i in range(b["y"].shape[0]):
                 for h in range(b["y"].shape[1]):
                     rows.append({
@@ -1807,8 +1804,6 @@ def generate_forecast_df(model, va_ld, M=50):
                         "oos_status": b["oos"][i, h].item(),
                         "p50_amxl": p50[i, h].item(),
                         "p70_amxl": p70[i, h].item(),
-                        "p50_scot": hm50[i, h].item(),
-                        "p70_scot": hm70[i, h].item(),
                     })
     return pd.DataFrame(rows)
 
@@ -4584,9 +4579,6 @@ def generate_joint_forecast_df(model, va_ld, M=100):
     with torch.no_grad():
         for b in va_ld:
             p50, p70, exp_hat = model.predict(b["x"], b["future_context"], M=M)
-            hist_mean = (b["x"][:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
-            hm50 = hist_mean.expand_as(b["y"])
-            hm70 = hm50 * 1.25
             for i in range(b["y"].shape[0]):
                 for h in range(b["y"].shape[1]):
                     rows.append({
@@ -4609,8 +4601,6 @@ def generate_joint_forecast_df(model, va_ld, M=100):
                         "oos_status": b["oos"][i, h].item(),
                         "p50_amxl": p50[i, h].item(),
                         "p70_amxl": p70[i, h].item(),
-                        "p50_scot": hm50[i, h].item(),
-                        "p70_scot": hm70[i, h].item(),
                     })
     return pd.DataFrame(rows)
 
@@ -4655,7 +4645,7 @@ def run_joint_exposure_demand_h3_end2end(
     detach_exposure_for_demand=False,
     remove_extreme=True,
     extreme_q=0.99,
-    output_csv="joint_exposure_demand_h3_forecast.csv",
+    output_csv="joint_exposure_demand_h3_forecast_real_scot_fixed.csv",
 ):
     """Run non-rolling H3 joint model on one snapshot.
 
@@ -4666,7 +4656,7 @@ def run_joint_exposure_demand_h3_end2end(
         raise ValueError("Use horizon=3 for this file.")
 
     print("=" * 88)
-    print("JOINT EXPOSURE + DEMAND H3 END-TO-END V1 | NON-ROLLING")
+    print("JOINT EXPOSURE + DEMAND H3 END-TO-END V1.1 | NON-ROLLING | REAL SCOT ALIGNED")
     print("Shared encoder: YES | Separate decoders: YES")
     print(f"Demand gradient through exposure_hat: {not detach_exposure_for_demand}")
     print("=" * 88)
@@ -4757,12 +4747,21 @@ def run_joint_exposure_demand_h3_end2end(
         "extreme_cap": extreme_cap,
     }
 
-    # Reuse the notebook's SCOT evaluator when its dependencies are available.
-    if scot_df is not None and "calculate_wape_using_lp_oos2" in globals() and "quick_error_check" in globals():
+    # Align against the real SCOT forecast file using the same ASIN/week keys
+    # and the same H1-H3 evaluation window as the standalone demand model.
+    if scot_df is not None:
         try:
-            result["final_wape"] = run_final_wape(result, remove_oos_dp=True, source="lp")
+            result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
+                result=result,
+                scot_df=scot_df,
+                data_raw1=data_raw1,
+                asin_stats=asin_stats,
+                remove_oos_dp=True,
+                source="lp",
+            )
+            result["final_wape"] = result["real_scot_outputs"]
         except Exception as e:
-            print(f"SCOT final WAPE evaluator skipped: {type(e).__name__}: {e}")
+            print(f"Real SCOT alignment/evaluation skipped: {type(e).__name__}: {e}")
 
     return result
 
@@ -4780,5 +4779,5 @@ def run_joint_exposure_demand_h3_end2end(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,  # true end-to-end
-#     output_csv="joint_exposure_demand_h3_forecast.csv",
+#     output_csv="joint_exposure_demand_h3_forecast_real_scot_fixed.csv",
 # )
