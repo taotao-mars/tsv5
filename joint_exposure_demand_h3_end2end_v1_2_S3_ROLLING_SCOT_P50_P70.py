@@ -2552,6 +2552,7 @@ def summarize_h1_h20_magnitude_diagnostics(
 # 10. Real SCOT alignment and WAPE
 # =====================================================
 
+
 def run_high_sparse_scot_alignment_wape(
     result,
     scot_df,
@@ -2561,56 +2562,64 @@ def run_high_sparse_scot_alignment_wape(
     source="lp",
 ):
     """
-    Align real SCOT forecasts to result["forecast_df"] and compute WAPE.
+    Self-contained real-SCOT alignment and direct P50/P70 WAPE evaluation.
+
+    This rolling-safe evaluator does not depend on notebook-global helper
+    functions such as calculate_wape_using_lp_oos2 or quick_error_check.
+    It evaluates AMXL and SCOT on exactly the same joined ASIN-week rows.
     """
-    if "calculate_wape_using_lp_oos2" not in globals():
-        raise RuntimeError("calculate_wape_using_lp_oos2 is not defined.")
-
-    if "quick_error_check" not in globals():
-        raise RuntimeError("quick_error_check is not defined.")
-
     forecast_df = result["forecast_df"].copy()
-    forecast_df.columns = [c.strip() for c in forecast_df.columns]
+    forecast_df.columns = [str(c).strip() for c in forecast_df.columns]
+
+    required_forecast = [
+        "asin", "order_week", "fbi_demand", "p50_amxl", "p70_amxl"
+    ]
+    missing_forecast = [
+        c for c in required_forecast if c not in forecast_df.columns
+    ]
+    if missing_forecast:
+        raise ValueError(
+            f"Missing forecast columns for SCOT evaluation: {missing_forecast}"
+        )
+
     forecast_df["asin"] = forecast_df["asin"].astype(str)
-    forecast_df["order_week"] = pd.to_datetime(forecast_df["order_week"])
+    forecast_df["order_week"] = pd.to_datetime(
+        forecast_df["order_week"], errors="coerce"
+    )
 
     scot = scot_df.copy()
-    scot.columns = [c.strip() for c in scot.columns]
+    scot.columns = [str(c).strip() for c in scot.columns]
 
-    for c in ["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]:
-        if c not in scot.columns:
-            raise ValueError(f"Missing SCOT column: {c}")
+    required_scot = [
+        "asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"
+    ]
+    missing_scot = [c for c in required_scot if c not in scot.columns]
+    if missing_scot:
+        raise ValueError(f"Missing SCOT columns: {missing_scot}")
 
     scot["asin"] = scot["asin"].astype(str)
-    scot["order_week"] = pd.to_datetime(scot["order_week"])
-    scot["forecast_qty_p50"] = pd.to_numeric(scot["forecast_qty_p50"], errors="coerce")
-    scot["forecast_qty_p70"] = pd.to_numeric(scot["forecast_qty_p70"], errors="coerce")
+    scot["order_week"] = pd.to_datetime(
+        scot["order_week"], errors="coerce"
+    )
+    scot["forecast_qty_p50"] = pd.to_numeric(
+        scot["forecast_qty_p50"], errors="coerce"
+    )
+    scot["forecast_qty_p70"] = pd.to_numeric(
+        scot["forecast_qty_p70"], errors="coerce"
+    )
 
-    if "fcst_start_week" in scot.columns:
-        scot["fcst_start_week"] = pd.to_datetime(scot["fcst_start_week"])
-
-    print("\n" + "=" * 80)
-    print("NB FORECAST WINDOW")
-    print("=" * 80)
-    print("NB rows:", len(forecast_df))
-    print("NB ASINs:", forecast_df["asin"].nunique())
-    print("NB weeks:", forecast_df["order_week"].min(), "to", forecast_df["order_week"].max())
-    print("NB week count:", forecast_df["order_week"].nunique())
-
-    print("\n" + "=" * 80)
-    print("REAL SCOT FORECAST FILE")
-    print("=" * 80)
-    print("SCOT rows:", len(scot))
-    print("SCOT ASINs:", scot["asin"].nunique())
-    print("SCOT weeks:", scot["order_week"].min(), "to", scot["order_week"].max())
-    print("SCOT week count:", scot["order_week"].nunique())
-
-    if "fcst_start_week" in scot.columns:
-        print("\nSCOT fcst_start_week counts:")
-        print(scot["fcst_start_week"].value_counts().sort_index())
-
+    # One parquet corresponds to one forecast cut. Deduplicate only within
+    # that cut; never average predictions across different cut files.
     scot_keep = (
-        scot[["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]]
+        scot[
+            [
+                "asin",
+                "order_week",
+                "forecast_qty_p50",
+                "forecast_qty_p70",
+            ]
+        ]
+        .dropna(subset=["asin", "order_week"])
         .groupby(["asin", "order_week"], as_index=False)
         .agg(
             forecast_qty_p50=("forecast_qty_p50", "mean"),
@@ -2618,130 +2627,153 @@ def run_high_sparse_scot_alignment_wape(
         )
     )
 
-    forecast_df_scot_real = forecast_df.merge(
+    joined = forecast_df.merge(
         scot_keep,
         on=["asin", "order_week"],
         how="inner",
+        validate="many_to_one",
     )
 
-    row_match_rate = len(forecast_df_scot_real) / max(len(forecast_df), 1)
-    asin_match_rate = (
-        forecast_df_scot_real["asin"].nunique()
-        / max(forecast_df["asin"].nunique(), 1)
+    if joined.empty:
+        raise RuntimeError(
+            "No ASIN-week rows matched between Joint forecast and this SCOT cut."
+        )
+
+    joined["fbi_demand"] = pd.to_numeric(
+        joined["fbi_demand"], errors="coerce"
+    ).fillna(0.0)
+    joined["p50_amxl"] = pd.to_numeric(
+        joined["p50_amxl"], errors="coerce"
+    ).fillna(0.0)
+    joined["p70_amxl"] = pd.to_numeric(
+        joined["p70_amxl"], errors="coerce"
+    ).fillna(0.0)
+
+    joined["p50_scot"] = joined["forecast_qty_p50"].fillna(0.0)
+    joined["p70_scot"] = np.maximum(
+        joined["forecast_qty_p70"].fillna(0.0),
+        joined["p50_scot"],
     )
 
-    print("\n" + "=" * 80)
-    print("ALIGNMENT CHECK")
-    print("=" * 80)
-    print("NB forecast rows:", len(forecast_df))
-    print("After SCOT merge rows:", len(forecast_df_scot_real))
-    print("Matched ASINs:", forecast_df_scot_real["asin"].nunique())
-    print("Matched weeks:", forecast_df_scot_real["order_week"].min(), "to",
-          forecast_df_scot_real["order_week"].max())
-    print("Matched week count:", forecast_df_scot_real["order_week"].nunique())
-    print("Row match rate:", row_match_rate)
-    print("ASIN match rate:", asin_match_rate)
+    # Apply OOS filtering only when an explicit row-level flag is available.
+    # This avoids silently changing the cohort.
+    oos_filter_col = None
+    if remove_oos_dp:
+        for candidate in [
+            "is_oos_dp",
+            "oos_dp",
+            "remove_oos_dp",
+            "is_oos",
+            "oos_flag",
+        ]:
+            if candidate in joined.columns:
+                oos_filter_col = candidate
+                break
 
-    print("\n" + "=" * 80)
-    print("ASIN SELECTION CHECK")
-    print("=" * 80)
-    print("Selected NB ASINs:", forecast_df["asin"].nunique())
-    print("Matched ASINs with SCOT:", forecast_df_scot_real["asin"].nunique())
+        if oos_filter_col is not None:
+            flag = joined[oos_filter_col]
+            if flag.dtype == bool:
+                keep = ~flag
+            else:
+                numeric_flag = pd.to_numeric(flag, errors="coerce").fillna(0)
+                keep = numeric_flag <= 0
+            joined = joined.loc[keep].copy()
+
+    if joined.empty:
+        raise RuntimeError("No rows remained after optional OOS filtering.")
+
+    truth = joined["fbi_demand"].to_numpy(dtype=float)
+    denom = np.abs(truth).sum() + 1e-8
+
+    def metric_row(quantile, amxl_col, scot_col):
+        amxl = joined[amxl_col].to_numpy(dtype=float)
+        scot_pred = joined[scot_col].to_numpy(dtype=float)
+
+        amxl_error = amxl - truth
+        scot_error = scot_pred - truth
+
+        return {
+            "quantile": quantile,
+            "n_rows": len(joined),
+            "n_asins": joined["asin"].nunique(),
+            "true_sum": truth.sum(),
+            "true_mean": truth.mean(),
+            "amxl_mean": amxl.mean(),
+            "scot_mean": scot_pred.mean(),
+            "amxl_wape": np.abs(amxl_error).sum() / denom,
+            "scot_wape": np.abs(scot_error).sum() / denom,
+            "amxl_ratio": amxl.sum() / (truth.sum() + 1e-8),
+            "scot_ratio": scot_pred.sum() / (truth.sum() + 1e-8),
+            "amxl_overbias": np.maximum(amxl_error, 0.0).sum() / denom,
+            "scot_overbias": np.maximum(scot_error, 0.0).sum() / denom,
+            "amxl_underbias": np.maximum(-amxl_error, 0.0).sum() / denom,
+            "scot_underbias": np.maximum(-scot_error, 0.0).sum() / denom,
+        }
+
+    p50_metrics = metric_row("p50", "p50_amxl", "p50_scot")
+    p70_metrics = metric_row("p70", "p70_amxl", "p70_scot")
+    wape_df = pd.DataFrame([p50_metrics, p70_metrics])
+
+    print("\n" + "=" * 88)
+    print("REAL SCOT ALIGNMENT — DIRECT P50/P70 COMPARISON")
+    print("=" * 88)
+    print("Joint rows before merge:", len(forecast_df))
+    print("Joint ASINs before merge:", forecast_df["asin"].nunique())
+    print("SCOT rows in cut:", len(scot_keep))
+    print("Matched rows:", len(joined))
+    print("Matched ASINs:", joined["asin"].nunique())
     print(
-        "Missing ASINs after SCOT merge:",
-        forecast_df["asin"].nunique() - forecast_df_scot_real["asin"].nunique(),
+        "Matched weeks:",
+        joined["order_week"].min(),
+        "to",
+        joined["order_week"].max(),
     )
+    print("OOS filter column used:", oos_filter_col)
+    print()
+    print(wape_df.round(4).to_string(index=False))
 
-    forecast_df_scot_real["p50_scot"] = forecast_df_scot_real["forecast_qty_p50"]
-    forecast_df_scot_real["p70_scot"] = np.maximum(
-        forecast_df_scot_real["forecast_qty_p70"],
-        forecast_df_scot_real["forecast_qty_p50"],
-    )
-
-    mean_check = pd.DataFrame([{
-        "n_rows": len(forecast_df_scot_real),
-        "n_asins": forecast_df_scot_real["asin"].nunique(),
-        "true_mean": forecast_df_scot_real["fbi_demand"].mean(),
-        "total_amt": (
-            forecast_df_scot_real["true_amt"].sum()
-            if "true_amt" in forecast_df_scot_real.columns
-            else np.nan
-        ),
-        "total_size": (
-            forecast_df_scot_real["true_size"].sum()
-            if "true_size" in forecast_df_scot_real.columns
-            else np.nan
-        ),
-        "amxl_p50_mean": forecast_df_scot_real["p50_amxl"].mean(),
-        "amxl_p70_mean": forecast_df_scot_real["p70_amxl"].mean(),
-        "real_scot_p50_mean": forecast_df_scot_real["p50_scot"].mean(),
-        "real_scot_p70_mean": forecast_df_scot_real["p70_scot"].mean(),
-        "true_zero_rate": (forecast_df_scot_real["fbi_demand"] == 0).mean(),
-        "true_active_ratio": (forecast_df_scot_real["fbi_demand"] > 0).mean(),
-    }])
-
-    print("\n" + "=" * 80)
-    print("FORECAST MEAN CHECK")
-    print("=" * 80)
-    print(mean_check.T)
-
-    wape_df = calculate_wape_using_lp_oos2(
-        forecast_df_scot_real,
-        [0.5, 0.7],
-        remove_oos_dp=remove_oos_dp,
-        source=source,
-    )
-
-    if asin_stats is None and "asin_stats" in result:
-        asin_stats = result["asin_stats"]
-
-    forecast_df_scot_real_with_group = attach_zero_group_to_joined_df(
-        forecast_df_scot_real,
-        asin_stats,
-    )
-
-    sparse_group_wape = summarize_wape_by_sparse_group(
-        wape_df,
-        forecast_df_scot_real_with_group,
-    )
-
-    cols_p50 = [
-        "p50_amxl_penalty", "p50_scot_penalty",
-        "p50_amxl_overbias", "p50_scot_overbias",
-        "p50_amxl_underbias", "p50_scot_underbias",
-        "fbi_demand",
-    ]
-
-    cols_p70 = [
-        "p70_amxl_penalty", "p70_scot_penalty",
-        "p70_amxl_overbias", "p70_scot_overbias",
-        "p70_amxl_underbias", "p70_scot_underbias",
-        "fbi_demand",
-    ]
-
-    p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
-    p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
-
-    print("\n" + "=" * 80)
-    print("FINAL WAPE WITH REAL SCOT")
-    print("=" * 80)
-    print("\nP50 WAPE:")
-    print(p50_wape)
-    print("P50 penalty diff AMXL - SCOT:", p50_penalty_diff)
-    print("\nP70 WAPE:")
-    print(p70_wape)
-    print("P70 penalty diff AMXL - SCOT:", p70_penalty_diff)
-
+    # Keep return keys compatible with the existing rolling runner.
     return {
-        "forecast_df_scot_real": forecast_df_scot_real,
-        "forecast_df_scot_real_with_group": forecast_df_scot_real_with_group,
+        "forecast_df_scot_real": joined,
+        "forecast_df_scot_real_with_group": joined,
         "wape_df": wape_df,
-        "sparse_group_wape": sparse_group_wape,
-        "mean_check": mean_check,
-        "p50_wape": p50_wape,
-        "p70_wape": p70_wape,
-        "p50_penalty_diff": p50_penalty_diff,
-        "p70_penalty_diff": p70_penalty_diff,
+        "sparse_group_wape": pd.DataFrame(),
+        "mean_check": wape_df[
+            [
+                "quantile",
+                "n_rows",
+                "n_asins",
+                "true_mean",
+                "amxl_mean",
+                "scot_mean",
+            ]
+        ].copy(),
+        "p50_wape": {
+            "amxl_wape": p50_metrics["amxl_wape"],
+            "scot_wape": p50_metrics["scot_wape"],
+            "amxl_ratio": p50_metrics["amxl_ratio"],
+            "scot_ratio": p50_metrics["scot_ratio"],
+            "amxl_overbias": p50_metrics["amxl_overbias"],
+            "scot_overbias": p50_metrics["scot_overbias"],
+            "amxl_underbias": p50_metrics["amxl_underbias"],
+            "scot_underbias": p50_metrics["scot_underbias"],
+        },
+        "p70_wape": {
+            "amxl_wape": p70_metrics["amxl_wape"],
+            "scot_wape": p70_metrics["scot_wape"],
+            "amxl_ratio": p70_metrics["amxl_ratio"],
+            "scot_ratio": p70_metrics["scot_ratio"],
+            "amxl_overbias": p70_metrics["amxl_overbias"],
+            "scot_overbias": p70_metrics["scot_overbias"],
+            "amxl_underbias": p70_metrics["amxl_underbias"],
+            "scot_underbias": p70_metrics["scot_underbias"],
+        },
+        "p50_penalty_diff": (
+            p50_metrics["amxl_wape"] - p50_metrics["scot_wape"]
+        ),
+        "p70_penalty_diff": (
+            p70_metrics["amxl_wape"] - p70_metrics["scot_wape"]
+        ),
     }
 
 
@@ -4776,7 +4808,11 @@ def run_joint_exposure_demand_h3_end2end(
             )
             result["final_wape"] = result["real_scot_outputs"]
         except Exception as e:
-            print(f"Real SCOT alignment/evaluation skipped: {type(e).__name__}: {e}")
+            print(
+                f"Real SCOT alignment/evaluation failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            raise
 
     return result
 
@@ -4998,7 +5034,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
-    output_root="joint_rolling_h3_scot",
+    output_root="joint_rolling_h3_scot_fixed",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -5061,7 +5097,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     pairs = pairs.reset_index(drop=True)
 
     print("\n" + "=" * 88)
-    print("JOINT H3 ROLLING + SCOT P50/P70")
+    print("JOINT H3 ROLLING + SELF-CONTAINED SCOT P50/P70")
     print("=" * 88)
     print("Cuts selected:", len(pairs))
     print("Random ASIN sample per cut:", n_asins)
@@ -5404,7 +5440,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_scot",
+#     output_root="joint_rolling_h3_scot_fixed",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -5423,7 +5459,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_scot",
+#     output_root="joint_rolling_h3_scot_fixed",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
