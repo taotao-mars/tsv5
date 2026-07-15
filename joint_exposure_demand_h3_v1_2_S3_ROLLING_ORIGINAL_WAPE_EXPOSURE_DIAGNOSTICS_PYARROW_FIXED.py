@@ -5229,6 +5229,7 @@ def _list_s3_keys(bucket, prefix, s3_client=None):
     return keys
 
 
+
 def list_joint_rolling_snapshot_pairs(
     bucket=ROLLING_S3_BUCKET,
     data_prefix=ROLLING_DATA_PREFIX,
@@ -5236,11 +5237,25 @@ def list_joint_rolling_snapshot_pairs(
     s3_client=None,
 ):
     """
-    Pair each Saturday feature snapshot with the corresponding Sunday SCOT file.
+    Build a leakage-controlled rolling backtest pairing.
+
+    For origin snapshot date D (Saturday):
+      - SCOT FCD is D + 1 day (Sunday)
+      - evaluation snapshot is D + 21 days
+
+    Why D + 21?
+      The evaluation snapshot's final observed Sunday is the SCOT H3 week.
+      Therefore the existing non-rolling validation logic (last 3 weeks)
+      produces exactly:
+        H1 = FCD
+        H2 = FCD + 7 days
+        H3 = FCD + 14 days
 
     Example:
-        data snapshot: 2025-10-04
-        SCOT FCD:     2025-10-05
+      origin snapshot: 2025-10-04, max observed week 2025-09-28
+      SCOT FCD:        2025-10-05
+      eval snapshot:   2025-10-25, max observed week 2025-10-19
+      model val H1-H3: 2025-10-05, 2025-10-12, 2025-10-19
     """
     s3_client = s3_client or boto3.client("s3")
 
@@ -5269,8 +5284,6 @@ def list_joint_rolling_snapshot_pairs(
             continue
 
         fcd = pd.Timestamp(match.group(1)).normalize()
-
-        # If both refresh and no_refresh exist, prefer no_refresh.
         previous = scot_by_date.get(fcd)
         if previous is None or (
             "no_refresh" in key and "no_refresh" not in previous
@@ -5278,38 +5291,46 @@ def list_joint_rolling_snapshot_pairs(
             scot_by_date[fcd] = key
 
     rows = []
-    for data_cut, data_key in sorted(data_by_date.items()):
-        expected_scot_fcd = data_cut + pd.Timedelta(days=1)
-        scot_key = scot_by_date.get(expected_scot_fcd)
+    for origin_cut, origin_key in sorted(data_by_date.items()):
+        scot_fcd = origin_cut + pd.Timedelta(days=1)
+        eval_cut = origin_cut + pd.Timedelta(days=21)
 
         rows.append({
-            "data_cut": data_cut,
-            "scot_fcd": expected_scot_fcd,
-            "data_key": data_key,
-            "scot_key": scot_key,
-            "has_scot": scot_key is not None,
+            "data_cut": origin_cut,
+            "scot_fcd": scot_fcd,
+            "eval_cut": eval_cut,
+            "data_key": origin_key,
+            "eval_data_key": data_by_date.get(eval_cut),
+            "scot_key": scot_by_date.get(scot_fcd),
+            "has_eval_snapshot": eval_cut in data_by_date,
+            "has_scot": scot_fcd in scot_by_date,
         })
 
     pairs = pd.DataFrame(rows)
+    if len(pairs):
+        pairs["is_complete_pair"] = (
+            pairs["has_eval_snapshot"] & pairs["has_scot"]
+        )
+    else:
+        pairs["is_complete_pair"] = pd.Series(dtype=bool)
 
-    print("=" * 88)
-    print("ROLLING SNAPSHOT / SCOT PAIR CHECK")
-    print("=" * 88)
+    print("=" * 96)
+    print("ROLLING ORIGIN / EVALUATION SNAPSHOT / SCOT PAIR CHECK")
+    print("=" * 96)
     print("Feature snapshots:", len(data_by_date))
     print("SCOT forecast files:", len(scot_by_date))
-    print("Matched pairs:", int(pairs["has_scot"].sum()) if len(pairs) else 0)
     print(
-        "Unmatched feature snapshots:",
+        "Complete rolling pairs:",
+        int(pairs["is_complete_pair"].sum()) if len(pairs) else 0,
+    )
+    print(
+        "Missing evaluation snapshot:",
+        int((~pairs["has_eval_snapshot"]).sum()) if len(pairs) else 0,
+    )
+    print(
+        "Missing SCOT file:",
         int((~pairs["has_scot"]).sum()) if len(pairs) else 0,
     )
-
-    if len(pairs):
-        print(
-            "Matched date range:",
-            pairs.loc[pairs["has_scot"], "data_cut"].min(),
-            "to",
-            pairs.loc[pairs["has_scot"], "data_cut"].max(),
-        )
 
     return pairs
 
@@ -5396,7 +5417,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
-    output_root="joint_rolling_h3_original_wape_exposure_diag_join_debug",
+    output_root="joint_true_rolling_h3_original_wape_exposure_diag",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -5451,7 +5472,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         s3_client=s3_client,
     )
 
-    pairs = pairs[pairs["has_scot"]].copy()
+    pairs = pairs[pairs["is_complete_pair"]].copy()
 
     if start_date is not None:
         pairs = pairs[
@@ -5475,7 +5496,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     pairs = pairs.reset_index(drop=True)
 
     print("\n" + "=" * 88)
-    print("JOINT H3 ROLLING + ORIGINAL WAPE + EXPOSURE DIAGNOSTICS + JOIN DEBUG")
+    print("JOINT H3 TRUE ROLLING + ORIGINAL WAPE + EXPOSURE DIAGNOSTICS")
     print("=" * 88)
     print("Cuts selected:", len(pairs))
     print("Random ASIN sample per cut:", n_asins)
@@ -5518,9 +5539,14 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         print("#" * 100)
 
         try:
-            data_raw1 = _read_s3_csv(
+            origin_raw = _read_s3_csv(
                 bucket,
                 row["data_key"],
+                s3_client,
+            )
+            eval_raw = _read_s3_csv(
+                bucket,
+                row["eval_data_key"],
                 s3_client,
             )
             scot_df = _read_s3_parquet(
@@ -5529,24 +5555,74 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 s3_client,
             )
 
+            for frame in [origin_raw, eval_raw, scot_df]:
+                frame["asin"] = frame["asin"].astype(str).str.strip()
+
+            origin_raw["order_week"] = pd.to_datetime(
+                origin_raw["order_week"], errors="coerce"
+            )
+            eval_raw["order_week"] = pd.to_datetime(
+                eval_raw["order_week"], errors="coerce"
+            )
+            scot_df["order_week"] = pd.to_datetime(
+                scot_df["order_week"], errors="coerce"
+            )
+
+            rng = np.random.default_rng(seed)
+            origin_asins = origin_raw["asin"].dropna().unique()
+            sampled_origin_asins = rng.choice(
+                origin_asins,
+                size=min(n_asins, len(origin_asins)),
+                replace=False,
+            )
+
+            sampled_set = set(sampled_origin_asins)
+            scot_set = set(scot_df["asin"].dropna().unique())
+            eval_set = set(eval_raw["asin"].dropna().unique())
+            rolling_asins = sorted(sampled_set & scot_set & eval_set)
+
+            if not rolling_asins:
+                raise RuntimeError(
+                    "No ASINs remain after origin-sample, SCOT, and "
+                    "evaluation-snapshot intersection."
+                )
+
+            # This is the missing rolling merge step:
+            # use the later evaluation snapshot to supply the actual H1-H3
+            # rows, but restrict it to ASINs sampled at the origin cut.
+            data_raw1 = eval_raw[
+                eval_raw["asin"].isin(rolling_asins)
+            ].copy()
+
+            expected_h1 = pd.Timestamp(row["scot_fcd"])
+            expected_h2 = expected_h1 + pd.Timedelta(days=7)
+            expected_h3 = expected_h1 + pd.Timedelta(days=14)
+
+            print("=" * 96)
+            print("ROLLING COHORT + TARGET-WEEK CONSTRUCTION")
+            print("=" * 96)
+            print("Origin snapshot:", pd.Timestamp(row["data_cut"]).date())
+            print("Evaluation snapshot:", pd.Timestamp(row["eval_cut"]).date())
+            print("SCOT FCD:", expected_h1.date())
             print(
-                f"Loaded data rows={len(data_raw1):,} | "
+                "Origin max observed week:",
+                origin_raw["order_week"].max(),
+            )
+            print(
+                "Evaluation max observed week:",
+                eval_raw["order_week"].max(),
+            )
+            print(
+                "Expected H1/H2/H3:",
+                [expected_h1, expected_h2, expected_h3],
+            )
+            print("Origin sampled ASINs:", len(sampled_set))
+            print("SCOT ASINs:", len(scot_set))
+            print("Evaluation ASINs:", len(eval_set))
+            print("Final rolling ASIN intersection:", len(rolling_asins))
+            print(
+                f"Evaluation rows used={len(data_raw1):,} | "
                 f"ASINs={data_raw1['asin'].nunique():,}"
-            )
-            print(
-                f"Loaded SCOT rows={len(scot_df):,} | "
-                f"ASINs={scot_df['asin'].nunique():,}"
-            )
-            print("Snapshot ASIN dtype:", data_raw1["asin"].dtype)
-            print("SCOT ASIN dtype:", scot_df["asin"].dtype)
-            print("Snapshot ASIN sample:", data_raw1["asin"].head(5).astype(str).tolist())
-            print("SCOT ASIN sample:", scot_df["asin"].head(5).astype(str).tolist())
-            print(
-                "Snapshot/SCOT canonical ASIN intersection:",
-                len(
-                    set(_canonical_asin_join_key(data_raw1["asin"]).unique())
-                    & set(_canonical_asin_join_key(scot_df["asin"]).unique())
-                ),
             )
 
             if (
@@ -5578,6 +5654,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 
                 aligned_df["data_cut"] = data_cut
                 aligned_df["scot_fcd"] = scot_fcd
+                aligned_df["eval_cut"] = pd.Timestamp(row["eval_cut"])
                 aligned_df["data_s3_key"] = row["data_key"]
                 aligned_df["scot_s3_key"] = row["scot_key"]
                 aligned_df.to_csv(aligned_path, index=False)
@@ -5637,7 +5714,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 result = run_joint_exposure_demand_h3_end2end(
                     data_raw1=data_raw1,
                     scot_df=scot_df,
-                    n_asins=n_asins,
+                    n_asins=len(rolling_asins),
                     seed=seed,
                     epochs=epochs,
                     history=history,
@@ -5666,12 +5743,44 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 
                 real_scot = result["real_scot_outputs"]
                 forecast_df = result["forecast_df"].copy()
+
+                joint_weeks = sorted(
+                    pd.to_datetime(
+                        forecast_df["order_week"], errors="coerce"
+                    ).dropna().unique()
+                )
+                scot_h3_weeks = sorted(
+                    pd.to_datetime(
+                        scot_df["order_week"], errors="coerce"
+                    ).dropna().unique()
+                )[:3]
+                expected_weeks = [
+                    expected_h1.to_datetime64(),
+                    expected_h2.to_datetime64(),
+                    expected_h3.to_datetime64(),
+                ]
+
+                print("\n" + "=" * 96)
+                print("ROLLING TARGET WEEK ASSERTION")
+                print("=" * 96)
+                print("Joint unique weeks:", joint_weeks)
+                print("SCOT first 3 weeks:", scot_h3_weeks)
+                print("Expected H1-H3:", expected_weeks)
+
+                if set(joint_weeks) != set(expected_weeks):
+                    raise RuntimeError(
+                        "Joint validation weeks do not equal the rolling "
+                        "SCOT H1-H3 weeks. The evaluation snapshot pairing "
+                        "or dataset split is incorrect."
+                    )
+
                 aligned_df = real_scot[
                     "forecast_df_scot_real"
                 ].copy()
 
                 forecast_df["data_cut"] = data_cut
                 forecast_df["scot_fcd"] = scot_fcd
+                forecast_df["eval_cut"] = pd.Timestamp(row["eval_cut"])
                 forecast_df["data_s3_key"] = row["data_key"]
                 forecast_df["scot_s3_key"] = row["scot_key"]
 
@@ -5972,7 +6081,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_original_wape_exposure_diag_join_debug",
+#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -5991,7 +6100,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_original_wape_exposure_diag_join_debug",
+#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
