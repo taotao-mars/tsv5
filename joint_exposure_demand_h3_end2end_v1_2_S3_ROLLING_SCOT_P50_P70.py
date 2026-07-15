@@ -2562,64 +2562,56 @@ def run_high_sparse_scot_alignment_wape(
     source="lp",
 ):
     """
-    Self-contained real-SCOT alignment and direct P50/P70 WAPE evaluation.
-
-    This rolling-safe evaluator does not depend on notebook-global helper
-    functions such as calculate_wape_using_lp_oos2 or quick_error_check.
-    It evaluates AMXL and SCOT on exactly the same joined ASIN-week rows.
+    Align real SCOT forecasts to result["forecast_df"] and compute WAPE.
     """
+    if "calculate_wape_using_lp_oos2" not in globals():
+        raise RuntimeError("calculate_wape_using_lp_oos2 is not defined.")
+
+    if "quick_error_check" not in globals():
+        raise RuntimeError("quick_error_check is not defined.")
+
     forecast_df = result["forecast_df"].copy()
-    forecast_df.columns = [str(c).strip() for c in forecast_df.columns]
-
-    required_forecast = [
-        "asin", "order_week", "fbi_demand", "p50_amxl", "p70_amxl"
-    ]
-    missing_forecast = [
-        c for c in required_forecast if c not in forecast_df.columns
-    ]
-    if missing_forecast:
-        raise ValueError(
-            f"Missing forecast columns for SCOT evaluation: {missing_forecast}"
-        )
-
+    forecast_df.columns = [c.strip() for c in forecast_df.columns]
     forecast_df["asin"] = forecast_df["asin"].astype(str)
-    forecast_df["order_week"] = pd.to_datetime(
-        forecast_df["order_week"], errors="coerce"
-    )
+    forecast_df["order_week"] = pd.to_datetime(forecast_df["order_week"])
 
     scot = scot_df.copy()
-    scot.columns = [str(c).strip() for c in scot.columns]
+    scot.columns = [c.strip() for c in scot.columns]
 
-    required_scot = [
-        "asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"
-    ]
-    missing_scot = [c for c in required_scot if c not in scot.columns]
-    if missing_scot:
-        raise ValueError(f"Missing SCOT columns: {missing_scot}")
+    for c in ["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]:
+        if c not in scot.columns:
+            raise ValueError(f"Missing SCOT column: {c}")
 
     scot["asin"] = scot["asin"].astype(str)
-    scot["order_week"] = pd.to_datetime(
-        scot["order_week"], errors="coerce"
-    )
-    scot["forecast_qty_p50"] = pd.to_numeric(
-        scot["forecast_qty_p50"], errors="coerce"
-    )
-    scot["forecast_qty_p70"] = pd.to_numeric(
-        scot["forecast_qty_p70"], errors="coerce"
-    )
+    scot["order_week"] = pd.to_datetime(scot["order_week"])
+    scot["forecast_qty_p50"] = pd.to_numeric(scot["forecast_qty_p50"], errors="coerce")
+    scot["forecast_qty_p70"] = pd.to_numeric(scot["forecast_qty_p70"], errors="coerce")
 
-    # One parquet corresponds to one forecast cut. Deduplicate only within
-    # that cut; never average predictions across different cut files.
+    if "fcst_start_week" in scot.columns:
+        scot["fcst_start_week"] = pd.to_datetime(scot["fcst_start_week"])
+
+    print("\n" + "=" * 80)
+    print("NB FORECAST WINDOW")
+    print("=" * 80)
+    print("NB rows:", len(forecast_df))
+    print("NB ASINs:", forecast_df["asin"].nunique())
+    print("NB weeks:", forecast_df["order_week"].min(), "to", forecast_df["order_week"].max())
+    print("NB week count:", forecast_df["order_week"].nunique())
+
+    print("\n" + "=" * 80)
+    print("REAL SCOT FORECAST FILE")
+    print("=" * 80)
+    print("SCOT rows:", len(scot))
+    print("SCOT ASINs:", scot["asin"].nunique())
+    print("SCOT weeks:", scot["order_week"].min(), "to", scot["order_week"].max())
+    print("SCOT week count:", scot["order_week"].nunique())
+
+    if "fcst_start_week" in scot.columns:
+        print("\nSCOT fcst_start_week counts:")
+        print(scot["fcst_start_week"].value_counts().sort_index())
+
     scot_keep = (
-        scot[
-            [
-                "asin",
-                "order_week",
-                "forecast_qty_p50",
-                "forecast_qty_p70",
-            ]
-        ]
-        .dropna(subset=["asin", "order_week"])
+        scot[["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]]
         .groupby(["asin", "order_week"], as_index=False)
         .agg(
             forecast_qty_p50=("forecast_qty_p50", "mean"),
@@ -2627,153 +2619,130 @@ def run_high_sparse_scot_alignment_wape(
         )
     )
 
-    joined = forecast_df.merge(
+    forecast_df_scot_real = forecast_df.merge(
         scot_keep,
         on=["asin", "order_week"],
         how="inner",
-        validate="many_to_one",
     )
 
-    if joined.empty:
-        raise RuntimeError(
-            "No ASIN-week rows matched between Joint forecast and this SCOT cut."
-        )
-
-    joined["fbi_demand"] = pd.to_numeric(
-        joined["fbi_demand"], errors="coerce"
-    ).fillna(0.0)
-    joined["p50_amxl"] = pd.to_numeric(
-        joined["p50_amxl"], errors="coerce"
-    ).fillna(0.0)
-    joined["p70_amxl"] = pd.to_numeric(
-        joined["p70_amxl"], errors="coerce"
-    ).fillna(0.0)
-
-    joined["p50_scot"] = joined["forecast_qty_p50"].fillna(0.0)
-    joined["p70_scot"] = np.maximum(
-        joined["forecast_qty_p70"].fillna(0.0),
-        joined["p50_scot"],
+    row_match_rate = len(forecast_df_scot_real) / max(len(forecast_df), 1)
+    asin_match_rate = (
+        forecast_df_scot_real["asin"].nunique()
+        / max(forecast_df["asin"].nunique(), 1)
     )
 
-    # Apply OOS filtering only when an explicit row-level flag is available.
-    # This avoids silently changing the cohort.
-    oos_filter_col = None
-    if remove_oos_dp:
-        for candidate in [
-            "is_oos_dp",
-            "oos_dp",
-            "remove_oos_dp",
-            "is_oos",
-            "oos_flag",
-        ]:
-            if candidate in joined.columns:
-                oos_filter_col = candidate
-                break
+    print("\n" + "=" * 80)
+    print("ALIGNMENT CHECK")
+    print("=" * 80)
+    print("NB forecast rows:", len(forecast_df))
+    print("After SCOT merge rows:", len(forecast_df_scot_real))
+    print("Matched ASINs:", forecast_df_scot_real["asin"].nunique())
+    print("Matched weeks:", forecast_df_scot_real["order_week"].min(), "to",
+          forecast_df_scot_real["order_week"].max())
+    print("Matched week count:", forecast_df_scot_real["order_week"].nunique())
+    print("Row match rate:", row_match_rate)
+    print("ASIN match rate:", asin_match_rate)
 
-        if oos_filter_col is not None:
-            flag = joined[oos_filter_col]
-            if flag.dtype == bool:
-                keep = ~flag
-            else:
-                numeric_flag = pd.to_numeric(flag, errors="coerce").fillna(0)
-                keep = numeric_flag <= 0
-            joined = joined.loc[keep].copy()
-
-    if joined.empty:
-        raise RuntimeError("No rows remained after optional OOS filtering.")
-
-    truth = joined["fbi_demand"].to_numpy(dtype=float)
-    denom = np.abs(truth).sum() + 1e-8
-
-    def metric_row(quantile, amxl_col, scot_col):
-        amxl = joined[amxl_col].to_numpy(dtype=float)
-        scot_pred = joined[scot_col].to_numpy(dtype=float)
-
-        amxl_error = amxl - truth
-        scot_error = scot_pred - truth
-
-        return {
-            "quantile": quantile,
-            "n_rows": len(joined),
-            "n_asins": joined["asin"].nunique(),
-            "true_sum": truth.sum(),
-            "true_mean": truth.mean(),
-            "amxl_mean": amxl.mean(),
-            "scot_mean": scot_pred.mean(),
-            "amxl_wape": np.abs(amxl_error).sum() / denom,
-            "scot_wape": np.abs(scot_error).sum() / denom,
-            "amxl_ratio": amxl.sum() / (truth.sum() + 1e-8),
-            "scot_ratio": scot_pred.sum() / (truth.sum() + 1e-8),
-            "amxl_overbias": np.maximum(amxl_error, 0.0).sum() / denom,
-            "scot_overbias": np.maximum(scot_error, 0.0).sum() / denom,
-            "amxl_underbias": np.maximum(-amxl_error, 0.0).sum() / denom,
-            "scot_underbias": np.maximum(-scot_error, 0.0).sum() / denom,
-        }
-
-    p50_metrics = metric_row("p50", "p50_amxl", "p50_scot")
-    p70_metrics = metric_row("p70", "p70_amxl", "p70_scot")
-    wape_df = pd.DataFrame([p50_metrics, p70_metrics])
-
-    print("\n" + "=" * 88)
-    print("REAL SCOT ALIGNMENT — DIRECT P50/P70 COMPARISON")
-    print("=" * 88)
-    print("Joint rows before merge:", len(forecast_df))
-    print("Joint ASINs before merge:", forecast_df["asin"].nunique())
-    print("SCOT rows in cut:", len(scot_keep))
-    print("Matched rows:", len(joined))
-    print("Matched ASINs:", joined["asin"].nunique())
+    print("\n" + "=" * 80)
+    print("ASIN SELECTION CHECK")
+    print("=" * 80)
+    print("Selected NB ASINs:", forecast_df["asin"].nunique())
+    print("Matched ASINs with SCOT:", forecast_df_scot_real["asin"].nunique())
     print(
-        "Matched weeks:",
-        joined["order_week"].min(),
-        "to",
-        joined["order_week"].max(),
+        "Missing ASINs after SCOT merge:",
+        forecast_df["asin"].nunique() - forecast_df_scot_real["asin"].nunique(),
     )
-    print("OOS filter column used:", oos_filter_col)
-    print()
-    print(wape_df.round(4).to_string(index=False))
 
-    # Keep return keys compatible with the existing rolling runner.
+    forecast_df_scot_real["p50_scot"] = forecast_df_scot_real["forecast_qty_p50"]
+    forecast_df_scot_real["p70_scot"] = np.maximum(
+        forecast_df_scot_real["forecast_qty_p70"],
+        forecast_df_scot_real["forecast_qty_p50"],
+    )
+
+    mean_check = pd.DataFrame([{
+        "n_rows": len(forecast_df_scot_real),
+        "n_asins": forecast_df_scot_real["asin"].nunique(),
+        "true_mean": forecast_df_scot_real["fbi_demand"].mean(),
+        "total_amt": (
+            forecast_df_scot_real["true_amt"].sum()
+            if "true_amt" in forecast_df_scot_real.columns
+            else np.nan
+        ),
+        "total_size": (
+            forecast_df_scot_real["true_size"].sum()
+            if "true_size" in forecast_df_scot_real.columns
+            else np.nan
+        ),
+        "amxl_p50_mean": forecast_df_scot_real["p50_amxl"].mean(),
+        "amxl_p70_mean": forecast_df_scot_real["p70_amxl"].mean(),
+        "real_scot_p50_mean": forecast_df_scot_real["p50_scot"].mean(),
+        "real_scot_p70_mean": forecast_df_scot_real["p70_scot"].mean(),
+        "true_zero_rate": (forecast_df_scot_real["fbi_demand"] == 0).mean(),
+        "true_active_ratio": (forecast_df_scot_real["fbi_demand"] > 0).mean(),
+    }])
+
+    print("\n" + "=" * 80)
+    print("FORECAST MEAN CHECK")
+    print("=" * 80)
+    print(mean_check.T)
+
+    wape_df = calculate_wape_using_lp_oos2(
+        forecast_df_scot_real,
+        [0.5, 0.7],
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+
+    if asin_stats is None and "asin_stats" in result:
+        asin_stats = result["asin_stats"]
+
+    forecast_df_scot_real_with_group = attach_zero_group_to_joined_df(
+        forecast_df_scot_real,
+        asin_stats,
+    )
+
+    sparse_group_wape = summarize_wape_by_sparse_group(
+        wape_df,
+        forecast_df_scot_real_with_group,
+    )
+
+    cols_p50 = [
+        "p50_amxl_penalty", "p50_scot_penalty",
+        "p50_amxl_overbias", "p50_scot_overbias",
+        "p50_amxl_underbias", "p50_scot_underbias",
+        "fbi_demand",
+    ]
+
+    cols_p70 = [
+        "p70_amxl_penalty", "p70_scot_penalty",
+        "p70_amxl_overbias", "p70_scot_overbias",
+        "p70_amxl_underbias", "p70_scot_underbias",
+        "fbi_demand",
+    ]
+
+    p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
+    p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
+
+    print("\n" + "=" * 80)
+    print("FINAL WAPE WITH REAL SCOT")
+    print("=" * 80)
+    print("\nP50 WAPE:")
+    print(p50_wape)
+    print("P50 penalty diff AMXL - SCOT:", p50_penalty_diff)
+    print("\nP70 WAPE:")
+    print(p70_wape)
+    print("P70 penalty diff AMXL - SCOT:", p70_penalty_diff)
+
     return {
-        "forecast_df_scot_real": joined,
-        "forecast_df_scot_real_with_group": joined,
+        "forecast_df_scot_real": forecast_df_scot_real,
+        "forecast_df_scot_real_with_group": forecast_df_scot_real_with_group,
         "wape_df": wape_df,
-        "sparse_group_wape": pd.DataFrame(),
-        "mean_check": wape_df[
-            [
-                "quantile",
-                "n_rows",
-                "n_asins",
-                "true_mean",
-                "amxl_mean",
-                "scot_mean",
-            ]
-        ].copy(),
-        "p50_wape": {
-            "amxl_wape": p50_metrics["amxl_wape"],
-            "scot_wape": p50_metrics["scot_wape"],
-            "amxl_ratio": p50_metrics["amxl_ratio"],
-            "scot_ratio": p50_metrics["scot_ratio"],
-            "amxl_overbias": p50_metrics["amxl_overbias"],
-            "scot_overbias": p50_metrics["scot_overbias"],
-            "amxl_underbias": p50_metrics["amxl_underbias"],
-            "scot_underbias": p50_metrics["scot_underbias"],
-        },
-        "p70_wape": {
-            "amxl_wape": p70_metrics["amxl_wape"],
-            "scot_wape": p70_metrics["scot_wape"],
-            "amxl_ratio": p70_metrics["amxl_ratio"],
-            "scot_ratio": p70_metrics["scot_ratio"],
-            "amxl_overbias": p70_metrics["amxl_overbias"],
-            "scot_overbias": p70_metrics["scot_overbias"],
-            "amxl_underbias": p70_metrics["amxl_underbias"],
-            "scot_underbias": p70_metrics["scot_underbias"],
-        },
-        "p50_penalty_diff": (
-            p50_metrics["amxl_wape"] - p50_metrics["scot_wape"]
-        ),
-        "p70_penalty_diff": (
-            p70_metrics["amxl_wape"] - p70_metrics["scot_wape"]
-        ),
+        "sparse_group_wape": sparse_group_wape,
+        "mean_check": mean_check,
+        "p50_wape": p50_wape,
+        "p70_wape": p70_wape,
+        "p50_penalty_diff": p50_penalty_diff,
+        "p70_penalty_diff": p70_penalty_diff,
     }
 
 
@@ -4835,6 +4804,287 @@ def run_joint_exposure_demand_h3_end2end(
 
 
 
+
+
+# ============================================================================
+# EXPOSURE HAT DIAGNOSTICS: OVERALL / HORIZON / CUT-HORIZON
+# ============================================================================
+
+def _safe_exposure_corr(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    if len(y_true) < 2:
+        return np.nan
+    if np.std(y_true) <= 1e-8 or np.std(y_pred) <= 1e-8:
+        return np.nan
+
+    return float(np.corrcoef(y_true, y_pred)[0, 1])
+
+
+def _safe_exposure_active_auc(y_true, score):
+    try:
+        from sklearn.metrics import roc_auc_score
+    except Exception:
+        return np.nan
+
+    y_true = np.asarray(y_true, dtype=float)
+    score = np.asarray(score, dtype=float)
+    active = (y_true > 0).astype(int)
+
+    if len(np.unique(active)) < 2:
+        return np.nan
+
+    try:
+        return float(roc_auc_score(active, score))
+    except Exception:
+        return np.nan
+
+
+def _exposure_metric_row(
+    sub,
+    channel,
+    true_col,
+    pred_col,
+):
+    valid = sub[
+        ["asin", true_col, pred_col]
+    ].dropna()
+
+    if valid.empty:
+        return {
+            "channel": channel,
+            "n_rows": 0,
+            "n_asins": 0,
+            "true_mean": np.nan,
+            "pred_mean": np.nan,
+            "pred_true_ratio": np.nan,
+            "wape": np.nan,
+            "mae": np.nan,
+            "corr": np.nan,
+            "overbias": np.nan,
+            "underbias": np.nan,
+            "true_zero_rate": np.nan,
+            "pred_zero_rate": np.nan,
+            "active_auc": np.nan,
+        }
+
+    y_true = pd.to_numeric(
+        valid[true_col], errors="coerce"
+    ).to_numpy(dtype=float)
+    y_pred = pd.to_numeric(
+        valid[pred_col], errors="coerce"
+    ).to_numpy(dtype=float)
+
+    finite = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[finite]
+    y_pred = y_pred[finite]
+
+    if len(y_true) == 0:
+        return {
+            "channel": channel,
+            "n_rows": 0,
+            "n_asins": 0,
+            "true_mean": np.nan,
+            "pred_mean": np.nan,
+            "pred_true_ratio": np.nan,
+            "wape": np.nan,
+            "mae": np.nan,
+            "corr": np.nan,
+            "overbias": np.nan,
+            "underbias": np.nan,
+            "true_zero_rate": np.nan,
+            "pred_zero_rate": np.nan,
+            "active_auc": np.nan,
+        }
+
+    error = y_pred - y_true
+    denom = np.abs(y_true).sum() + 1e-8
+
+    return {
+        "channel": channel,
+        "n_rows": len(y_true),
+        "n_asins": valid.loc[finite, "asin"].astype(str).nunique(),
+        "true_mean": y_true.mean(),
+        "pred_mean": y_pred.mean(),
+        "pred_true_ratio": y_pred.sum() / (y_true.sum() + 1e-8),
+        "wape": np.abs(error).sum() / denom,
+        "mae": np.abs(error).mean(),
+        "corr": _safe_exposure_corr(y_true, y_pred),
+        "overbias": np.maximum(error, 0.0).sum() / denom,
+        "underbias": np.maximum(-error, 0.0).sum() / denom,
+        "true_zero_rate": np.mean(y_true <= 0),
+        "pred_zero_rate": np.mean(y_pred <= 0),
+        "active_auc": _safe_exposure_active_auc(y_true, y_pred),
+    }
+
+
+def compute_exposure_hat_diagnostics(
+    forecast_df,
+    data_cut=None,
+):
+    """
+    Compute exposure_hat diagnostics for total, buy-box, and in-stock.
+
+    Returns:
+      overall_df
+      by_horizon_df
+      by_cut_horizon_df
+    """
+    df = forecast_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    channel_specs = [
+        (
+            "total",
+            "true_future_total_dph",
+            "pred_total_dph_hat",
+        ),
+        (
+            "buy_box",
+            "true_future_buy_box_dph",
+            "pred_buy_box_dph_hat",
+        ),
+        (
+            "in_stock",
+            "true_future_instock",
+            "pred_instock_dph_hat",
+        ),
+    ]
+
+    required = ["asin", "fcst_week_index"]
+    for _, true_col, pred_col in channel_specs:
+        required.extend([true_col, pred_col])
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing exposure diagnostic columns: {missing}"
+        )
+
+    df["asin"] = df["asin"].astype(str)
+    df["fcst_week_index"] = pd.to_numeric(
+        df["fcst_week_index"], errors="coerce"
+    )
+
+    if data_cut is not None:
+        df["data_cut"] = pd.Timestamp(data_cut)
+
+    overall_rows = []
+    by_h_rows = []
+    by_cut_h_rows = []
+
+    for channel, true_col, pred_col in channel_specs:
+        overall_rows.append(
+            _exposure_metric_row(
+                df,
+                channel,
+                true_col,
+                pred_col,
+            )
+        )
+
+    horizons = sorted(
+        int(h)
+        for h in df["fcst_week_index"].dropna().unique()
+    )
+
+    for horizon in horizons:
+        sub_h = df[df["fcst_week_index"] == horizon]
+
+        for channel, true_col, pred_col in channel_specs:
+            row = _exposure_metric_row(
+                sub_h,
+                channel,
+                true_col,
+                pred_col,
+            )
+            row["horizon"] = horizon
+            by_h_rows.append(row)
+
+    if "data_cut" in df.columns:
+        for cut_value, sub_cut in df.groupby(
+            "data_cut", dropna=False
+        ):
+            for horizon in horizons:
+                sub_h = sub_cut[
+                    sub_cut["fcst_week_index"] == horizon
+                ]
+
+                for channel, true_col, pred_col in channel_specs:
+                    row = _exposure_metric_row(
+                        sub_h,
+                        channel,
+                        true_col,
+                        pred_col,
+                    )
+                    row["data_cut"] = cut_value
+                    row["horizon"] = horizon
+                    by_cut_h_rows.append(row)
+
+    return {
+        "overall": pd.DataFrame(overall_rows),
+        "by_horizon": pd.DataFrame(by_h_rows),
+        "by_cut_horizon": pd.DataFrame(by_cut_h_rows),
+    }
+
+
+def print_exposure_hat_diagnostics(
+    diagnostics,
+    title="EXPOSURE HAT DIAGNOSTICS",
+):
+    overall_df = diagnostics["overall"]
+    by_horizon_df = diagnostics["by_horizon"]
+
+    print("\n" + "=" * 100)
+    print(title + " — OVERALL")
+    print("=" * 100)
+    print(
+        overall_df[
+            [
+                "channel",
+                "n_rows",
+                "n_asins",
+                "true_mean",
+                "pred_mean",
+                "pred_true_ratio",
+                "wape",
+                "corr",
+                "overbias",
+                "underbias",
+                "active_auc",
+            ]
+        ]
+        .round(4)
+        .to_string(index=False)
+    )
+
+    print("\n" + "=" * 100)
+    print(title + " — BY HORIZON")
+    print("=" * 100)
+    print(
+        by_horizon_df[
+            [
+                "horizon",
+                "channel",
+                "n_rows",
+                "n_asins",
+                "true_mean",
+                "pred_mean",
+                "pred_true_ratio",
+                "wape",
+                "corr",
+                "overbias",
+                "underbias",
+                "active_auc",
+            ]
+        ]
+        .sort_values(["horizon", "channel"])
+        .round(4)
+        .to_string(index=False)
+    )
+
+
 # ============================================================================
 # ROLLING S3 RUNNER: JOINT H3 + MATCHED SCOT P50/P70
 # ============================================================================
@@ -5034,7 +5284,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
-    output_root="joint_rolling_h3_scot_fixed",
+    output_root="joint_rolling_h3_original_wape_exposure_diag",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -5057,6 +5307,22 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     """
     if horizon != 3:
         raise ValueError("This rolling experiment is H3 only.")
+
+    missing_wape_helpers = [
+        name
+        for name in [
+            "calculate_wape_using_lp_oos2",
+            "quick_error_check",
+        ]
+        if name not in globals()
+    ]
+    if missing_wape_helpers:
+        raise RuntimeError(
+            "The rolling file intentionally does not implement WAPE. "
+            "Load the same existing helper functions used by the two-stage "
+            "model before running. Missing: "
+            + ", ".join(missing_wape_helpers)
+        )
 
     output_root = Path(output_root)
     per_cut_dir = output_root / "per_cut"
@@ -5097,7 +5363,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     pairs = pairs.reset_index(drop=True)
 
     print("\n" + "=" * 88)
-    print("JOINT H3 ROLLING + SELF-CONTAINED SCOT P50/P70")
+    print("JOINT H3 ROLLING + ORIGINAL TWO-STAGE WAPE + EXPOSURE DIAGNOSTICS")
     print("=" * 88)
     print("Cuts selected:", len(pairs))
     print("Random ASIN sample per cut:", n_asins)
@@ -5105,10 +5371,17 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     print("Output root:", output_root.resolve())
     print("Model unchanged from non-rolling V1.2: YES")
     print("Metrics retained: P50 and P70 only")
+    print(
+        "WAPE: calls original calculate_wape_using_lp_oos2 "
+        "+ quick_error_check; no local WAPE formula"
+    )
 
     summary_rows = []
     all_forecasts = []
     all_aligned = []
+    all_exposure_overall = []
+    all_exposure_by_horizon = []
+    all_exposure_by_cut_horizon = []
 
     for run_index, row in pairs.iterrows():
         data_cut = pd.Timestamp(row["data_cut"])
@@ -5133,6 +5406,26 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         print("#" * 100)
 
         try:
+            data_raw1 = _read_s3_csv(
+                bucket,
+                row["data_key"],
+                s3_client,
+            )
+            scot_df = _read_s3_parquet(
+                bucket,
+                row["scot_key"],
+                s3_client,
+            )
+
+            print(
+                f"Loaded data rows={len(data_raw1):,} | "
+                f"ASINs={data_raw1['asin'].nunique():,}"
+            )
+            print(
+                f"Loaded SCOT rows={len(scot_df):,} | "
+                f"ASINs={scot_df['asin'].nunique():,}"
+            )
+
             if (
                 resume_existing
                 and forecast_path.exists()
@@ -5143,70 +5436,81 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     forecast_path,
                     parse_dates=["order_week"],
                 )
-                aligned_df = pd.read_csv(
-                    aligned_path,
-                    parse_dates=["order_week"],
+
+                # Use the exact same evaluator as two-stage, even on resume.
+                result_stub = {
+                    "forecast_df": forecast_df,
+                }
+                real_scot = run_high_sparse_scot_alignment_wape(
+                    result=result_stub,
+                    scot_df=scot_df,
+                    data_raw1=data_raw1,
+                    asin_stats=None,
+                    remove_oos_dp=remove_oos_dp,
+                    source="lp",
+                )
+                aligned_df = real_scot[
+                    "forecast_df_scot_real"
+                ].copy()
+
+                aligned_df["data_cut"] = data_cut
+                aligned_df["scot_fcd"] = scot_fcd
+                aligned_df["data_s3_key"] = row["data_key"]
+                aligned_df["scot_s3_key"] = row["scot_key"]
+                aligned_df.to_csv(aligned_path, index=False)
+
+                exposure_diag = compute_exposure_hat_diagnostics(
+                    forecast_df,
+                    data_cut=data_cut,
+                )
+                print_exposure_hat_diagnostics(
+                    exposure_diag,
+                    title=(
+                        "EXPOSURE HAT DIAGNOSTICS | "
+                        f"CUT={data_cut.date()} | LOADED"
+                    ),
                 )
 
-                # Recompute simple comparable WAPE directly from saved rows.
-                denominator = (
-                    np.abs(aligned_df["fbi_demand"]).sum() + 1e-8
+                exposure_diag["overall"].to_csv(
+                    per_cut_dir
+                    / f"exposure_hat_overall_cut_{cut_token}.csv",
+                    index=False,
                 )
-                metrics = {
-                    "p50_amxl_wape": (
-                        np.abs(
-                            aligned_df["p50_amxl"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                    "p50_scot_wape": (
-                        np.abs(
-                            aligned_df["p50_scot"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                    "p70_amxl_wape": (
-                        np.abs(
-                            aligned_df["p70_amxl"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                    "p70_scot_wape": (
-                        np.abs(
-                            aligned_df["p70_scot"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                }
+                exposure_diag["by_horizon"].to_csv(
+                    per_cut_dir
+                    / f"exposure_hat_by_horizon_cut_{cut_token}.csv",
+                    index=False,
+                )
+                exposure_diag["by_cut_horizon"].to_csv(
+                    per_cut_dir
+                    / f"exposure_hat_by_cut_horizon_cut_{cut_token}.csv",
+                    index=False,
+                )
+
+                metrics = {}
+                metrics.update(
+                    _extract_wape_metrics(
+                        real_scot.get("p50_wape"),
+                        "p50",
+                    )
+                )
+                metrics.update(
+                    _extract_wape_metrics(
+                        real_scot.get("p70_wape"),
+                        "p70",
+                    )
+                )
+                metrics["p50_penalty_diff"] = real_scot.get(
+                    "p50_penalty_diff"
+                )
+                metrics["p70_penalty_diff"] = real_scot.get(
+                    "p70_penalty_diff"
+                )
 
                 result = None
                 status = "loaded_existing"
 
             else:
-                data_raw1 = _read_s3_csv(
-                    bucket,
-                    row["data_key"],
-                    s3_client,
-                )
-                scot_df = _read_s3_parquet(
-                    bucket,
-                    row["scot_key"],
-                    s3_client,
-                )
-
-                print(
-                    f"Loaded data rows={len(data_raw1):,} | "
-                    f"ASINs={data_raw1['asin'].nunique():,}"
-                )
-                print(
-                    f"Loaded SCOT rows={len(scot_df):,} | "
-                    f"ASINs={scot_df['asin'].nunique():,}"
-                )
-
                 result = run_joint_exposure_demand_h3_end2end(
                     data_raw1=data_raw1,
                     scot_df=scot_df,
@@ -5256,6 +5560,35 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 forecast_df.to_csv(forecast_path, index=False)
                 aligned_df.to_csv(aligned_path, index=False)
 
+                # Exposure hat diagnostics for this rolling cut.
+                exposure_diag = compute_exposure_hat_diagnostics(
+                    forecast_df,
+                    data_cut=data_cut,
+                )
+                print_exposure_hat_diagnostics(
+                    exposure_diag,
+                    title=(
+                        "EXPOSURE HAT DIAGNOSTICS | "
+                        f"CUT={data_cut.date()}"
+                    ),
+                )
+
+                exposure_diag["overall"].to_csv(
+                    per_cut_dir
+                    / f"exposure_hat_overall_cut_{cut_token}.csv",
+                    index=False,
+                )
+                exposure_diag["by_horizon"].to_csv(
+                    per_cut_dir
+                    / f"exposure_hat_by_horizon_cut_{cut_token}.csv",
+                    index=False,
+                )
+                exposure_diag["by_cut_horizon"].to_csv(
+                    per_cut_dir
+                    / f"exposure_hat_by_cut_horizon_cut_{cut_token}.csv",
+                    index=False,
+                )
+
                 # Keep the original two-step P50/P70 outputs in summary.
                 metrics = {}
                 metrics.update(
@@ -5271,40 +5604,12 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     )
                 )
 
-                # Add transparent standard WAPE values on the exact aligned rows.
-                denominator = (
-                    np.abs(aligned_df["fbi_demand"]).sum() + 1e-8
+                metrics["p50_penalty_diff"] = real_scot.get(
+                    "p50_penalty_diff"
                 )
-                metrics.update({
-                    "p50_amxl_wape_standard": (
-                        np.abs(
-                            aligned_df["p50_amxl"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                    "p50_scot_wape_standard": (
-                        np.abs(
-                            aligned_df["p50_scot"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                    "p70_amxl_wape_standard": (
-                        np.abs(
-                            aligned_df["p70_amxl"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                    "p70_scot_wape_standard": (
-                        np.abs(
-                            aligned_df["p70_scot"]
-                            - aligned_df["fbi_demand"]
-                        ).sum()
-                        / denominator
-                    ),
-                })
+                metrics["p70_penalty_diff"] = real_scot.get(
+                    "p70_penalty_diff"
+                )
 
                 status = "trained"
 
@@ -5320,6 +5625,18 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 "aligned_asins": aligned_df["asin"].nunique(),
                 "aligned_week_min": aligned_df["order_week"].min(),
                 "aligned_week_max": aligned_df["order_week"].max(),
+                **{
+                    f"exposure_{row['channel']}_{metric}": row[metric]
+                    for _, row in exposure_diag["overall"].iterrows()
+                    for metric in [
+                        "wape",
+                        "pred_true_ratio",
+                        "corr",
+                        "overbias",
+                        "underbias",
+                        "active_auc",
+                    ]
+                },
                 **metrics,
                 "error": "",
             }
@@ -5327,6 +5644,19 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             summary_rows.append(summary)
             all_forecasts.append(forecast_df)
             all_aligned.append(aligned_df)
+
+            exposure_overall_cut = exposure_diag["overall"].copy()
+            exposure_overall_cut["data_cut"] = data_cut
+            all_exposure_overall.append(exposure_overall_cut)
+
+            exposure_by_h_cut = exposure_diag["by_horizon"].copy()
+            exposure_by_h_cut["data_cut"] = data_cut
+            all_exposure_by_horizon.append(exposure_by_h_cut)
+
+            if not exposure_diag["by_cut_horizon"].empty:
+                all_exposure_by_cut_horizon.append(
+                    exposure_diag["by_cut_horizon"].copy()
+                )
 
             pd.DataFrame(summary_rows).to_csv(
                 output_root / "joint_rolling_p50_p70_summary.csv",
@@ -5397,6 +5727,66 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         index=False,
     )
 
+    if all_exposure_overall:
+        exposure_overall_full = pd.concat(
+            all_exposure_overall,
+            ignore_index=True,
+        )
+        exposure_overall_full.to_csv(
+            output_root / "exposure_hat_overall_by_cut.csv",
+            index=False,
+        )
+    else:
+        exposure_overall_full = pd.DataFrame()
+
+    if all_exposure_by_horizon:
+        exposure_by_horizon_full = pd.concat(
+            all_exposure_by_horizon,
+            ignore_index=True,
+        )
+        exposure_by_horizon_full.to_csv(
+            output_root / "exposure_hat_by_cut_and_horizon.csv",
+            index=False,
+        )
+    else:
+        exposure_by_horizon_full = pd.DataFrame()
+
+    if all_exposure_by_cut_horizon:
+        exposure_by_cut_horizon_full = pd.concat(
+            all_exposure_by_cut_horizon,
+            ignore_index=True,
+        )
+    else:
+        exposure_by_cut_horizon_full = pd.DataFrame()
+
+    # Diagnostics across all rolling cuts combined.
+    if not full_forecast_df.empty:
+        combined_exposure_diag = compute_exposure_hat_diagnostics(
+            full_forecast_df
+        )
+        print_exposure_hat_diagnostics(
+            combined_exposure_diag,
+            title="EXPOSURE HAT DIAGNOSTICS | ALL ROLLING CUTS",
+        )
+        combined_exposure_diag["overall"].to_csv(
+            output_root / "exposure_hat_full_overall.csv",
+            index=False,
+        )
+        combined_exposure_diag["by_horizon"].to_csv(
+            output_root / "exposure_hat_full_by_horizon.csv",
+            index=False,
+        )
+        combined_exposure_diag["by_cut_horizon"].to_csv(
+            output_root / "exposure_hat_full_by_cut_horizon.csv",
+            index=False,
+        )
+    else:
+        combined_exposure_diag = {
+            "overall": pd.DataFrame(),
+            "by_horizon": pd.DataFrame(),
+            "by_cut_horizon": pd.DataFrame(),
+        }
+
     print("\n" + "=" * 88)
     print("ROLLING RUN COMPLETE")
     print("=" * 88)
@@ -5419,6 +5809,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         "summary": summary_df,
         "forecast_df": full_forecast_df,
         "aligned_scot_df": full_aligned_df,
+        "exposure_hat_overall_by_cut": exposure_overall_full,
+        "exposure_hat_by_cut_and_horizon": exposure_by_horizon_full,
+        "exposure_hat_full_diagnostics": combined_exposure_diag,
         "snapshot_pairs": pairs,
         "output_root": str(output_root),
     }
@@ -5440,7 +5833,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_scot_fixed",
+#     output_root="joint_rolling_h3_original_wape_exposure_diag",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -5459,7 +5852,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_scot_fixed",
+#     output_root="joint_rolling_h3_original_wape_exposure_diag",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
