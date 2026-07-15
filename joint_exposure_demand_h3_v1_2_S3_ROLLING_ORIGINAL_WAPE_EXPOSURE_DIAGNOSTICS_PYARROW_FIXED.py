@@ -2553,6 +2553,81 @@ def summarize_h1_h20_magnitude_diagnostics(
 # =====================================================
 
 
+
+def _canonical_asin_join_key(series):
+    """Create a stable ASIN join key without changing model features."""
+    s = series.astype("string").str.strip()
+    s = s.str.replace(r"\\.0+$", "", regex=True)
+
+    # Normalize values that arrived through CSV as scientific notation/float.
+    numeric = pd.to_numeric(s, errors="coerce")
+    numeric_mask = numeric.notna()
+    if numeric_mask.any():
+        rounded = numeric.loc[numeric_mask].round()
+        integer_like = (numeric.loc[numeric_mask] - rounded).abs() < 1e-6
+        integer_index = integer_like[integer_like].index
+        if len(integer_index):
+            s.loc[integer_index] = rounded.loc[integer_index].astype("Int64").astype("string")
+
+    return s.astype(str)
+
+
+def _normalize_week_to_sunday(series):
+    dt = pd.to_datetime(series, errors="coerce").dt.normalize()
+    return dt + pd.to_timedelta((6 - dt.dt.dayofweek) % 7, unit="D")
+
+
+def _print_join_key_debug(forecast_df, scot):
+    """Print raw/canonical ASIN and week overlap before any merge."""
+    forecast_raw_asins = set(forecast_df["asin"].dropna().astype(str).unique())
+    scot_raw_asins = set(scot["asin"].dropna().astype(str).unique())
+
+    forecast_canonical = set(
+        _canonical_asin_join_key(forecast_df["asin"]).dropna().unique()
+    )
+    scot_canonical = set(
+        _canonical_asin_join_key(scot["asin"]).dropna().unique()
+    )
+
+    forecast_weeks = set(
+        pd.to_datetime(forecast_df["order_week"], errors="coerce")
+        .dropna().dt.normalize().unique()
+    )
+    scot_weeks = set(
+        pd.to_datetime(scot["order_week"], errors="coerce")
+        .dropna().dt.normalize().unique()
+    )
+    forecast_sunday_weeks = set(
+        _normalize_week_to_sunday(forecast_df["order_week"])
+        .dropna().unique()
+    )
+    scot_sunday_weeks = set(
+        _normalize_week_to_sunday(scot["order_week"])
+        .dropna().unique()
+    )
+
+    debug = {
+        "forecast_asin_dtype": str(forecast_df["asin"].dtype),
+        "scot_asin_dtype": str(scot["asin"].dtype),
+        "forecast_asin_sample": forecast_df["asin"].head(5).astype(str).tolist(),
+        "scot_asin_sample": scot["asin"].head(5).astype(str).tolist(),
+        "raw_asin_intersection": len(forecast_raw_asins & scot_raw_asins),
+        "canonical_asin_intersection": len(forecast_canonical & scot_canonical),
+        "raw_week_intersection": len(forecast_weeks & scot_weeks),
+        "sunday_week_intersection": len(forecast_sunday_weeks & scot_sunday_weeks),
+        "forecast_week_values": sorted(str(pd.Timestamp(x).date()) for x in forecast_weeks)[:10],
+        "scot_week_values": sorted(str(pd.Timestamp(x).date()) for x in scot_weeks)[:10],
+    }
+
+    print("\\n" + "=" * 88)
+    print("JOIN KEY DEBUG — BEFORE SCOT MERGE")
+    print("=" * 88)
+    for key, value in debug.items():
+        print(f"{key}: {value}")
+
+    return debug
+
+
 def run_high_sparse_scot_alignment_wape(
     result,
     scot_df,
@@ -2610,6 +2685,36 @@ def run_high_sparse_scot_alignment_wape(
         print("\nSCOT fcst_start_week counts:")
         print(scot["fcst_start_week"].value_counts().sort_index())
 
+    alignment_debug = _print_join_key_debug(forecast_df, scot)
+
+    # Auto-repair only when diagnostics prove the raw key format is the issue.
+    if (
+        alignment_debug["raw_asin_intersection"] == 0
+        and alignment_debug["canonical_asin_intersection"] > 0
+    ):
+        print(
+            "ASIN raw formats differ but canonical ASINs overlap. "
+            "Using canonical ASIN join keys."
+        )
+        forecast_df["asin"] = _canonical_asin_join_key(forecast_df["asin"])
+        scot["asin"] = _canonical_asin_join_key(scot["asin"])
+
+    # Auto-repair week anchors only when raw weeks have no overlap and mapping
+    # both sides to Sunday produces overlap. This handles Saturday snapshot
+    # labels versus Sunday SCOT order_week labels without blindly adding a day.
+    if (
+        alignment_debug["raw_week_intersection"] == 0
+        and alignment_debug["sunday_week_intersection"] > 0
+    ):
+        print(
+            "Raw order_week anchors differ but Sunday-normalized weeks overlap. "
+            "Normalizing both join keys to Sunday."
+        )
+        forecast_df["order_week"] = _normalize_week_to_sunday(
+            forecast_df["order_week"]
+        )
+        scot["order_week"] = _normalize_week_to_sunday(scot["order_week"])
+
     scot_keep = (
         scot[["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]]
         .groupby(["asin", "order_week"], as_index=False)
@@ -2624,6 +2729,12 @@ def run_high_sparse_scot_alignment_wape(
         on=["asin", "order_week"],
         how="inner",
     )
+
+    if forecast_df_scot_real.empty:
+        raise RuntimeError(
+            "No ASIN-week rows matched after raw and diagnostic-safe key "
+            "normalization. Review the JOIN KEY DEBUG block above."
+        )
 
     row_match_rate = len(forecast_df_scot_real) / max(len(forecast_df), 1)
     asin_match_rate = (
@@ -2734,6 +2845,7 @@ def run_high_sparse_scot_alignment_wape(
     print("P70 penalty diff AMXL - SCOT:", p70_penalty_diff)
 
     return {
+        "alignment_debug": alignment_debug,
         "forecast_df_scot_real": forecast_df_scot_real,
         "forecast_df_scot_real_with_group": forecast_df_scot_real_with_group,
         "wape_df": wape_df,
@@ -5208,49 +5320,10 @@ def _read_s3_csv(bucket, key, s3_client=None):
     return pd.read_csv(io.BytesIO(body))
 
 
-
 def _read_s3_parquet(bucket, key, s3_client=None):
-    """
-    Read parquet from S3 and repair the duplicated PyArrow pandas extension
-    registration occasionally caused by repeatedly running files in Jupyter.
-    """
     s3_client = s3_client or boto3.client("s3")
     body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-    buffer = io.BytesIO(body)
-
-    try:
-        return pd.read_parquet(buffer, engine="pyarrow")
-    except Exception as exc:
-        message = str(exc)
-        duplicate_extension_error = (
-            "already defined" in message
-            and ("pandas.period" in message or "pandas.interval" in message)
-        )
-        if not duplicate_extension_error:
-            raise
-
-        print(
-            "Detected duplicated PyArrow pandas extension registration; "
-            "removing stale registrations and retrying once."
-        )
-        import pyarrow as pa
-        for extension_name in ["pandas.period", "pandas.interval"]:
-            try:
-                pa.unregister_extension_type(extension_name)
-                print(f"Unregistered stale extension: {extension_name}")
-            except Exception:
-                pass
-
-        buffer.seek(0)
-        try:
-            return pd.read_parquet(buffer, engine="pyarrow")
-        except Exception as retry_exc:
-            raise RuntimeError(
-                "Parquet reading still failed after repairing duplicate PyArrow "
-                "extension registrations. Restart the Jupyter kernel once, reload "
-                "this file, and rerun. Retry error: "
-                f"{type(retry_exc).__name__}: {retry_exc}"
-            ) from retry_exc
+    return pd.read_parquet(io.BytesIO(body))
 
 
 def _extract_wape_metrics(wape_object, prefix):
@@ -5323,7 +5396,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
-    output_root="joint_rolling_h3_original_wape_exposure_diag_pyarrow_fixed",
+    output_root="joint_rolling_h3_original_wape_exposure_diag_join_debug",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -5402,7 +5475,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     pairs = pairs.reset_index(drop=True)
 
     print("\n" + "=" * 88)
-    print("JOINT H3 ROLLING + ORIGINAL TWO-STAGE WAPE + EXPOSURE DIAGNOSTICS")
+    print("JOINT H3 ROLLING + ORIGINAL WAPE + EXPOSURE DIAGNOSTICS + JOIN DEBUG")
     print("=" * 88)
     print("Cuts selected:", len(pairs))
     print("Random ASIN sample per cut:", n_asins)
@@ -5463,6 +5536,17 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             print(
                 f"Loaded SCOT rows={len(scot_df):,} | "
                 f"ASINs={scot_df['asin'].nunique():,}"
+            )
+            print("Snapshot ASIN dtype:", data_raw1["asin"].dtype)
+            print("SCOT ASIN dtype:", scot_df["asin"].dtype)
+            print("Snapshot ASIN sample:", data_raw1["asin"].head(5).astype(str).tolist())
+            print("SCOT ASIN sample:", scot_df["asin"].head(5).astype(str).tolist())
+            print(
+                "Snapshot/SCOT canonical ASIN intersection:",
+                len(
+                    set(_canonical_asin_join_key(data_raw1["asin"]).unique())
+                    & set(_canonical_asin_join_key(scot_df["asin"]).unique())
+                ),
             )
 
             if (
@@ -5664,6 +5748,22 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 "aligned_asins": aligned_df["asin"].nunique(),
                 "aligned_week_min": aligned_df["order_week"].min(),
                 "aligned_week_max": aligned_df["order_week"].max(),
+                "raw_asin_intersection": (
+                    real_scot.get("alignment_debug", {}).get("raw_asin_intersection")
+                    if "real_scot" in locals() else np.nan
+                ),
+                "canonical_asin_intersection": (
+                    real_scot.get("alignment_debug", {}).get("canonical_asin_intersection")
+                    if "real_scot" in locals() else np.nan
+                ),
+                "raw_week_intersection": (
+                    real_scot.get("alignment_debug", {}).get("raw_week_intersection")
+                    if "real_scot" in locals() else np.nan
+                ),
+                "sunday_week_intersection": (
+                    real_scot.get("alignment_debug", {}).get("sunday_week_intersection")
+                    if "real_scot" in locals() else np.nan
+                ),
                 **{
                     f"exposure_{row['channel']}_{metric}": row[metric]
                     for _, row in exposure_diag["overall"].iterrows()
@@ -5872,7 +5972,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_original_wape_exposure_diag_pyarrow_fixed",
+#     output_root="joint_rolling_h3_original_wape_exposure_diag_join_debug",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -5891,7 +5991,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_rolling_h3_original_wape_exposure_diag_pyarrow_fixed",
+#     output_root="joint_rolling_h3_original_wape_exposure_diag_join_debug",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
