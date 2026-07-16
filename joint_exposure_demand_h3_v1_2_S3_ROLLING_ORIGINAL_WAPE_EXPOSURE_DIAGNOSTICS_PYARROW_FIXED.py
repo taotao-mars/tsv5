@@ -4904,7 +4904,7 @@ def run_joint_exposure_demand_h3_end2end(
 # joint_result_h3 = run_joint_exposure_demand_h3_end2end(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
-#     n_asins=5000,
+#     n_asins=None,
 #     epochs=60,
 #     history=52,
 #     horizon=3,
@@ -5417,7 +5417,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
-    output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+    output_root="joint_true_rolling_h3_full_asin_original_wape_exposure_diag",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -5499,7 +5499,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     print("JOINT H3 TRUE ROLLING + ORIGINAL WAPE + EXPOSURE DIAGNOSTICS")
     print("=" * 88)
     print("Cuts selected:", len(pairs))
-    print("Random ASIN sample per cut:", n_asins)
+    print("ASIN mode:", "FULL_ASIN" if n_asins is None else f"RANDOM_{int(n_asins)}")
     print("Seed:", seed)
     print("Output root:", output_root.resolve())
     print("Model unchanged from non-rolling V1.2: YES")
@@ -5515,6 +5515,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     all_exposure_overall = []
     all_exposure_by_horizon = []
     all_exposure_by_cut_horizon = []
+    all_eval_raw_for_final_wape = []
 
     for run_index, row in pairs.iterrows():
         data_cut = pd.Timestamp(row["data_cut"])
@@ -5568,18 +5569,27 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 scot_df["order_week"], errors="coerce"
             )
 
-            rng = np.random.default_rng(seed)
             origin_asins = origin_raw["asin"].dropna().unique()
-            sampled_origin_asins = rng.choice(
-                origin_asins,
-                size=min(n_asins, len(origin_asins)),
-                replace=False,
-            )
 
-            sampled_set = set(sampled_origin_asins)
+            if n_asins is None:
+                sampled_set = set(origin_asins)
+                asin_mode = "FULL_ASIN"
+            else:
+                sample_size = min(int(n_asins), len(origin_asins))
+                rng = np.random.default_rng(seed)
+                sampled_origin_asins = rng.choice(
+                    origin_asins,
+                    size=sample_size,
+                    replace=False,
+                )
+                sampled_set = set(sampled_origin_asins)
+                asin_mode = f"RANDOM_{sample_size}"
+
             scot_set = set(scot_df["asin"].dropna().unique())
             eval_set = set(eval_raw["asin"].dropna().unique())
-            rolling_asins = sorted(sampled_set & scot_set & eval_set)
+            rolling_asins = sorted(
+                sampled_set & scot_set & eval_set
+            )
 
             if not rolling_asins:
                 raise RuntimeError(
@@ -5616,7 +5626,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 "Expected H1/H2/H3:",
                 [expected_h1, expected_h2, expected_h3],
             )
-            print("Origin sampled ASINs:", len(sampled_set))
+            print("ASIN mode:", asin_mode)
+            print("Origin candidate ASINs:", len(origin_asins))
+            print("Origin selected ASINs:", len(sampled_set))
             print("SCOT ASINs:", len(scot_set))
             print("Evaluation ASINs:", len(eval_set))
             print("Final rolling ASIN intersection:", len(rolling_asins))
@@ -5893,6 +5905,10 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             all_forecasts.append(forecast_df)
             all_aligned.append(aligned_df)
 
+            eval_raw_for_cut = data_raw1.copy()
+            eval_raw_for_cut["data_cut"] = data_cut
+            all_eval_raw_for_final_wape.append(eval_raw_for_cut)
+
             exposure_overall_cut = exposure_diag["overall"].copy()
             exposure_overall_cut["data_cut"] = data_cut
             all_exposure_overall.append(exposure_overall_cut)
@@ -5969,6 +5985,31 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         )
     else:
         full_aligned_df = pd.DataFrame()
+
+    if all_eval_raw_for_final_wape:
+        full_data_raw1_for_wape = pd.concat(
+            all_eval_raw_for_final_wape,
+            ignore_index=True,
+        )
+    else:
+        full_data_raw1_for_wape = pd.DataFrame()
+
+    if not full_aligned_df.empty:
+        final_demand_wape = run_final_rolling_wape_original_functions(
+            full_aligned_df=full_aligned_df,
+            full_data_raw1=full_data_raw1_for_wape,
+            remove_oos_dp=remove_oos_dp,
+            source="lp",
+            output_root=output_root,
+        )
+    else:
+        final_demand_wape = {
+            "overall_p50": None,
+            "overall_p70": None,
+            "by_horizon": {},
+            "overall_table": pd.DataFrame(),
+            "horizon_table": pd.DataFrame(),
+        }
 
     summary_df.to_csv(
         output_root / "joint_rolling_p50_p70_summary.csv",
@@ -6060,19 +6101,290 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         "exposure_hat_overall_by_cut": exposure_overall_full,
         "exposure_hat_by_cut_and_horizon": exposure_by_horizon_full,
         "exposure_hat_full_diagnostics": combined_exposure_diag,
+        "final_demand_wape": final_demand_wape,
         "snapshot_pairs": pairs,
         "output_root": str(output_root),
     }
 
 
+
+
 # ============================================================================
-# RECOMMENDED USAGE: FIRST TEST TWO ROLLING CUTS
+# FINAL ROLLING DEMAND EVALUATION
+# Uses ONLY the original two-stage WAPE pipeline:
+#   calculate_wape_using_lp_oos2(...)
+#   quick_error_check(...)
+# ============================================================================
+
+def _run_original_wape_for_aligned_rows(
+    aligned_df,
+    data_raw1,
+    quantile,
+    remove_oos_dp=True,
+    source="lp",
+):
+    """
+    Run the same original two-stage WAPE functions on one aligned dataframe.
+
+    quantile:
+        "p50" or "p70"
+
+    This function does not calculate WAPE directly.
+    """
+    if quantile not in {"p50", "p70"}:
+        raise ValueError("quantile must be 'p50' or 'p70'.")
+
+    required_helpers = [
+        "calculate_wape_using_lp_oos2",
+        "quick_error_check",
+    ]
+    missing_helpers = [
+        name for name in required_helpers
+        if name not in globals()
+    ]
+    if missing_helpers:
+        raise RuntimeError(
+            "Missing original WAPE helper functions: "
+            + ", ".join(missing_helpers)
+        )
+
+    df = aligned_df.copy()
+
+    amxl_col = f"{quantile}_amxl"
+    scot_col = f"{quantile}_scot"
+
+    required_cols = [
+        "asin",
+        "order_week",
+        "fbi_demand",
+        amxl_col,
+        scot_col,
+    ]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing aligned columns for {quantile}: {missing_cols}"
+        )
+
+    # Keep the exact aligned rows and original column names expected by
+    # calculate_wape_using_lp_oos2 / quick_error_check.
+    eval_result = {
+        "forecast_df": df.copy(),
+    }
+
+    wape_inputs = calculate_wape_using_lp_oos2(
+        result=eval_result,
+        data_raw1=data_raw1,
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+
+    return quick_error_check(
+        wape_inputs,
+        p50_col=amxl_col,
+        p70_col=amxl_col,
+        scot_p50_col=scot_col,
+        scot_p70_col=scot_col,
+        demand_col="fbi_demand",
+    )
+
+
+def run_final_rolling_wape_original_functions(
+    full_aligned_df,
+    full_data_raw1,
+    remove_oos_dp=True,
+    source="lp",
+    output_root="joint_true_rolling_h3_full_asin_original_wape_exposure_diag",
+):
+    """
+    Final demand evaluation after all rolling cuts finish.
+
+    Produces:
+      1. Overall P50/P70 AMXL vs SCOT
+      2. H1, H2, H3 P50/P70 AMXL vs SCOT
+      3. Uses only the original two-stage WAPE helper functions
+      4. Never averages per-cut WAPE values
+      5. Never calculates WAPE with a local formula
+    """
+    if full_aligned_df is None or len(full_aligned_df) == 0:
+        raise RuntimeError(
+            "No aligned rolling rows are available for final WAPE."
+        )
+
+    df = full_aligned_df.copy()
+    df["order_week"] = pd.to_datetime(
+        df["order_week"], errors="coerce"
+    )
+
+    if "fcst_week_index" not in df.columns:
+        raise ValueError(
+            "full_aligned_df must contain fcst_week_index for H1-H3 evaluation."
+        )
+
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 100)
+    print("FINAL ROLLING DEMAND WAPE — ORIGINAL TWO-STAGE FUNCTIONS")
+    print("=" * 100)
+    print("Aligned rows:", len(df))
+    print("Aligned ASINs:", df["asin"].nunique())
+    if "data_cut" in df.columns:
+        print("Rolling cuts:", df["data_cut"].nunique())
+
+    overall_p50 = _run_original_wape_for_aligned_rows(
+        aligned_df=df,
+        data_raw1=full_data_raw1,
+        quantile="p50",
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+    overall_p70 = _run_original_wape_for_aligned_rows(
+        aligned_df=df,
+        data_raw1=full_data_raw1,
+        quantile="p70",
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+
+    overall_records = []
+    for quantile, result_obj in [
+        ("p50", overall_p50),
+        ("p70", overall_p70),
+    ]:
+        row = {"scope": "overall", "horizon": "all", "quantile": quantile}
+
+        if isinstance(result_obj, pd.DataFrame):
+            if len(result_obj) == 1:
+                row.update(result_obj.iloc[0].to_dict())
+            else:
+                row["result_repr"] = result_obj.to_json(orient="records")
+        elif isinstance(result_obj, pd.Series):
+            row.update(result_obj.to_dict())
+        elif isinstance(result_obj, dict):
+            row.update(result_obj)
+        else:
+            row["result"] = result_obj
+
+        overall_records.append(row)
+
+    horizon_records = []
+    horizon_results = {}
+
+    for horizon in [1, 2, 3]:
+        sub = df[
+            pd.to_numeric(
+                df["fcst_week_index"], errors="coerce"
+            ) == horizon
+        ].copy()
+
+        if sub.empty:
+            print(f"H{horizon}: no aligned rows; skipped.")
+            continue
+
+        print("\n" + "-" * 100)
+        print(f"H{horizon} ORIGINAL WAPE EVALUATION")
+        print("-" * 100)
+        print("Rows:", len(sub))
+        print("ASINs:", sub["asin"].nunique())
+
+        p50_result = _run_original_wape_for_aligned_rows(
+            aligned_df=sub,
+            data_raw1=full_data_raw1,
+            quantile="p50",
+            remove_oos_dp=remove_oos_dp,
+            source=source,
+        )
+        p70_result = _run_original_wape_for_aligned_rows(
+            aligned_df=sub,
+            data_raw1=full_data_raw1,
+            quantile="p70",
+            remove_oos_dp=remove_oos_dp,
+            source=source,
+        )
+
+        horizon_results[horizon] = {
+            "p50": p50_result,
+            "p70": p70_result,
+        }
+
+        for quantile, result_obj in [
+            ("p50", p50_result),
+            ("p70", p70_result),
+        ]:
+            row = {
+                "scope": "horizon",
+                "horizon": horizon,
+                "quantile": quantile,
+            }
+
+            if isinstance(result_obj, pd.DataFrame):
+                if len(result_obj) == 1:
+                    row.update(result_obj.iloc[0].to_dict())
+                else:
+                    row["result_repr"] = result_obj.to_json(
+                        orient="records"
+                    )
+            elif isinstance(result_obj, pd.Series):
+                row.update(result_obj.to_dict())
+            elif isinstance(result_obj, dict):
+                row.update(result_obj)
+            else:
+                row["result"] = result_obj
+
+            horizon_records.append(row)
+
+    overall_df = pd.DataFrame(overall_records)
+    horizon_df = pd.DataFrame(horizon_records)
+
+    overall_df.to_csv(
+        output_root / "final_overall_p50_p70_original_wape.csv",
+        index=False,
+    )
+    horizon_df.to_csv(
+        output_root / "final_h1_h2_h3_p50_p70_original_wape.csv",
+        index=False,
+    )
+
+    print("\nSaved final rolling demand evaluation:")
+    print(
+        " ",
+        output_root / "final_overall_p50_p70_original_wape.csv",
+    )
+    print(
+        " ",
+        output_root / "final_h1_h2_h3_p50_p70_original_wape.csv",
+    )
+
+    return {
+        "overall_p50": overall_p50,
+        "overall_p70": overall_p70,
+        "by_horizon": horizon_results,
+        "overall_table": overall_df,
+        "horizon_table": horizon_df,
+    }
+
+
+# ============================================================================
+# RECOMMENDED USAGE — FULL ASIN, NO RANDOM SAMPLING
 # ============================================================================
 #
-# rolling_joint_h3 = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000,
+# Before running, load the same original WAPE helper functions used by the
+# non-rolling two-stage model:
+#
+#   calculate_wape_using_lp_oos2
+#   quick_error_check
+#
+# Then run:
+#
+# %run -i joint_exposure_demand_h3_v1_2_TRUE_ROLLING_FULL_ASIN_FINAL_WAPE_BY_HORIZON.py
+#
+# FIRST TEST: one rolling cut, short training
+#
+# rolling_joint_h3_full = run_joint_h3_s3_rolling_scot_p50_p70(
+#     n_asins=None,              # FULL ASIN; no random 5000 sampling
 #     seed=42,
-#     max_snapshots=2,
+#     max_snapshots=1,
 #     select_latest=False,
 #     epochs=3,
 #     patience=2,
@@ -6081,17 +6393,21 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
-#     resume_existing=True,
+#     remove_oos_dp=True,
+#     output_root=(
+#         "joint_true_rolling_h3_full_asin_"
+#         "final_wape_by_horizon"
+#     ),
+#     resume_existing=False,
 #     continue_on_error=False,
 # )
 #
-# Full rolling run after the test succeeds:
+# FULL RUN: all complete rolling cuts, all intersected ASINs
 #
-# rolling_joint_h3 = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000,
+# rolling_joint_h3_full = run_joint_h3_s3_rolling_scot_p50_p70(
+#     n_asins=None,              # FULL ASIN; no random sampling
 #     seed=42,
-#     max_snapshots=None,
+#     max_snapshots=None,        # all complete origin/eval/SCOT pairs
 #     select_latest=False,
 #     epochs=60,
 #     patience=6,
@@ -6100,7 +6416,30 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+#     remove_oos_dp=True,
+#     output_root=(
+#         "joint_true_rolling_h3_full_asin_"
+#         "final_wape_by_horizon"
+#     ),
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
+#
+# Final demand results:
+#
+# rolling_joint_h3_full["final_demand_wape"]["overall_table"]
+# rolling_joint_h3_full["final_demand_wape"]["horizon_table"]
+#
+# Exposure diagnostics:
+#
+# rolling_joint_h3_full[
+#     "exposure_hat_full_diagnostics"
+# ]["by_horizon"]
+#
+# Main output files:
+#
+# final_overall_p50_p70_original_wape.csv
+# final_h1_h2_h3_p50_p70_original_wape.csv
+# joint_rolling_p50_p70_summary.csv
+# joint_h3_scot_aligned_full.csv
+# exposure_hat_full_by_horizon.csv
