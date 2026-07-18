@@ -6096,7 +6096,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 print("SCOT first 3 weeks:", scot_h3_weeks)
                 print("Expected H1-H3:", expected_weeks)
 
-                if set(joint_weeks) != set(expected_weeks):
+                if {pd.Timestamp(w) for w in joint_weeks} != {pd.Timestamp(w) for w in expected_weeks}:
                     raise RuntimeError(
                         "Joint validation weeks do not equal the rolling "
                         "SCOT H1-H3 weeks. The evaluation snapshot pairing "
