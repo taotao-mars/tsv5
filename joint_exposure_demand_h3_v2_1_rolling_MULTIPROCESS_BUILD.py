@@ -6581,8 +6581,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     continue_on_error=True,
 # )
 #
-# All-ASIN run (no sampling -- n_asins=None uses every ASIN in each cut,
-# everything else identical to the full rolling run above):
+# All-ASIN run (no sampling -- n_asins=None uses every ASIN in each cut).
+# Uses its own output_root, separate from the n_asins=5000 runs above, so
+# resume_existing=True can never load a cached per-cut result that was
+# actually trained on the 5000-ASIN sample -- each output_root is its own
+# independent cache namespace, keyed only by data_cut, not by n_asins:
 #
 # rolling_joint_h3_all_asins = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=None,
@@ -6596,7 +6599,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+#     output_root="joint_true_rolling_h3_all_asins",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
