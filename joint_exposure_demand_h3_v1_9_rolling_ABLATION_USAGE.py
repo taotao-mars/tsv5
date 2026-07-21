@@ -21,6 +21,8 @@ Supported exposure modes:
   - all3
 """
 
+import os
+import multiprocessing as mp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -4481,6 +4483,68 @@ class _GraphContextMixin:
 _ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT = load_real_data
 _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CONTEXT = DemandDataset
 
+
+# =====================================================
+# Parallel sample construction for DemandDataset.__init__
+# =====================================================
+# Building every training window's tensors is CPU-bound, pure-Python work
+# (dict + torch.tensor() construction per window) -- threads don't help here
+# because of the GIL, only separate processes do. This relies on the "fork"
+# start method (default on Linux): a module-level global is set to the
+# half-built dataset instance right before the worker pool is created, so
+# each forked worker inherits it via copy-on-write for free, with no
+# per-task pickling of the (potentially large) `data` dict. Workers call the
+# exact same `_make_future_context_with_dph_proxies` / `_inject_graph_context`
+# instance methods as the serial path -- there is no duplicated/rewritten
+# logic here, so results are identical to the single-process version, just
+# computed across multiple cores. If anything about the parallel path fails
+# (pickling, platform without fork, etc.) it falls back to the plain serial
+# loop automatically.
+_MP_BUILD_DATASET = None
+
+
+def _mp_build_dataset_worker(asin_starts):
+    asin, starts, history, horizon = asin_starts
+    ds = _MP_BUILD_DATASET
+    d = ds.data[asin]
+    out = []
+    for start in starts:
+        fc = ds._make_future_context_with_dph_proxies(
+            d=d, start=start, history=history, horizon=horizon,
+        )
+        fc = ds._inject_graph_context(fc, d, asin, start + history)
+        out.append({
+            "x": np.asarray(d["features"][start:start+history], dtype=np.float32),
+            "future_context": np.asarray(fc, dtype=np.float32),
+            "y": np.asarray(d["demand"][start+history:start+history+horizon], dtype=np.float32),
+            "asin": asin,
+            "target_week": [str(w)[:10] for w in d["week"][start+history:start+history+horizon]],
+            "oos": np.asarray(d["oos"][start+history:start+history+horizon], dtype=np.float32),
+            "our_price": np.asarray(d["price_raw"][start+history:start+history+horizon], dtype=np.float32),
+            "pkg_volume": np.asarray(d["pkg_volume_raw"][start+history:start+history+horizon], dtype=np.float32),
+            "future_instock": np.asarray(d["instock_raw"][start+history:start+history+horizon], dtype=np.float32),
+            "future_total_dph": np.asarray(d["total_dph_raw"][start+history:start+history+horizon], dtype=np.float32),
+            "future_buy_box_dph": np.asarray(d["buy_box_dph_raw"][start+history:start+history+horizon], dtype=np.float32),
+        })
+    return out
+
+
+def _mp_row_to_tensors(raw):
+    return {
+        "x": torch.from_numpy(raw["x"]),
+        "future_context": torch.from_numpy(raw["future_context"]),
+        "y": torch.from_numpy(raw["y"]),
+        "asin": raw["asin"],
+        "target_week": raw["target_week"],
+        "oos": torch.from_numpy(raw["oos"]),
+        "our_price": torch.from_numpy(raw["our_price"]),
+        "pkg_volume": torch.from_numpy(raw["pkg_volume"]),
+        "future_instock": torch.from_numpy(raw["future_instock"]),
+        "future_total_dph": torch.from_numpy(raw["future_total_dph"]),
+        "future_buy_box_dph": torch.from_numpy(raw["future_buy_box_dph"]),
+    }
+
+
 EXTERNAL_HAT_COLS = [
     "external_total_dph_hat_log",
     "external_buy_box_dph_hat_log",
@@ -4516,41 +4580,73 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
 
 class DemandDataset(_GraphContextMixin, _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CONTEXT):
-    def __init__(self, data, history=52, horizon=3, mode="train", val_weeks=20, min_graph_neighbors=3):
+    def __init__(self, data, history=52, horizon=3, mode="train", val_weeks=20,
+                 min_graph_neighbors=3, num_build_workers=None):
         self.data = data
         self.history = history
         self.horizon = horizon
+        self.val_weeks = val_weeks
         self._init_graph_context(min_graph_neighbors=min_graph_neighbors)
         self.samples = []
+
+        asin_starts = []
         for asin, d in data.items():
             T = len(d["demand"])
             if mode == "train":
-                starts = range(max(0, T - val_weeks - horizon - history + 1))
+                starts = list(range(max(0, T - val_weeks - horizon - history + 1)))
             else:
                 s = T - history - horizon
                 starts = [s] if s >= 0 else []
+            if starts:
+                asin_starts.append((asin, starts, history, horizon))
 
-            for start in starts:
-                fc = self._make_future_context_with_dph_proxies(
-                    d=d,
-                    start=start,
-                    history=history,
-                    horizon=horizon,
-                )
-                fc = self._inject_graph_context(fc, d, asin, start + history)
-                self.samples.append({
-                    "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
-                    "future_context": torch.tensor(fc, dtype=torch.float32),
-                    "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
-                    "asin": asin,
-                    "target_week": [str(w)[:10] for w in d["week"][start+history:start+history+horizon]],
-                    "oos": torch.tensor(d["oos"][start+history:start+history+horizon], dtype=torch.float32),
-                    "our_price": torch.tensor(d["price_raw"][start+history:start+history+horizon], dtype=torch.float32),
-                    "pkg_volume": torch.tensor(d["pkg_volume_raw"][start+history:start+history+horizon], dtype=torch.float32),
-                    "future_instock": torch.tensor(d["instock_raw"][start+history:start+history+horizon], dtype=torch.float32),
-                    "future_total_dph": torch.tensor(d["total_dph_raw"][start+history:start+history+horizon], dtype=torch.float32),
-                    "future_buy_box_dph": torch.tensor(d["buy_box_dph_raw"][start+history:start+history+horizon], dtype=torch.float32),
-                })
+        if num_build_workers is None:
+            num_build_workers = max(1, (os.cpu_count() or 1) - 1)
+
+        built_in_parallel = False
+        if num_build_workers > 1 and len(asin_starts) >= 2 and mp.get_start_method(allow_none=True) != "spawn":
+            try:
+                global _MP_BUILD_DATASET
+                _MP_BUILD_DATASET = self  # inherited via fork copy-on-write, not pickled per task
+                ctx = mp.get_context("fork")
+                with ctx.Pool(processes=min(num_build_workers, len(asin_starts))) as pool:
+                    for raw_chunk in pool.imap(_mp_build_dataset_worker, asin_starts, chunksize=4):
+                        for raw in raw_chunk:
+                            self.samples.append(_mp_row_to_tensors(raw))
+                built_in_parallel = True
+            except Exception as e:
+                print(f"Parallel DemandDataset build failed ({type(e).__name__}: {e}); "
+                      f"falling back to serial construction.")
+                self.samples = []
+            finally:
+                _MP_BUILD_DATASET = None
+
+        if not built_in_parallel:
+            for asin, starts, history, horizon in asin_starts:
+                d = data[asin]
+                for start in starts:
+                    fc = self._make_future_context_with_dph_proxies(
+                        d=d, start=start, history=history, horizon=horizon,
+                    )
+                    fc = self._inject_graph_context(fc, d, asin, start + history)
+                    self.samples.append({
+                        "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
+                        "future_context": torch.tensor(fc, dtype=torch.float32),
+                        "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
+                        "asin": asin,
+                        "target_week": [str(w)[:10] for w in d["week"][start+history:start+history+horizon]],
+                        "oos": torch.tensor(d["oos"][start+history:start+history+horizon], dtype=torch.float32),
+                        "our_price": torch.tensor(
+                            d["price_raw"][start+history:start+history+horizon], dtype=torch.float32),
+                        "pkg_volume": torch.tensor(
+                            d["pkg_volume_raw"][start+history:start+history+horizon], dtype=torch.float32),
+                        "future_instock": torch.tensor(
+                            d["instock_raw"][start+history:start+history+horizon], dtype=torch.float32),
+                        "future_total_dph": torch.tensor(
+                            d["total_dph_raw"][start+history:start+history+horizon], dtype=torch.float32),
+                        "future_buy_box_dph": torch.tensor(
+                            d["buy_box_dph_raw"][start+history:start+history+horizon], dtype=torch.float32),
+                    })
 
 
 def run_demand_with_predicted_exposure_all_modes_graph(
@@ -5147,8 +5243,8 @@ def run_joint_exposure_demand_h3_end2end(
         )
     tr_ds = DemandDataset(data, history, horizon, "train", horizon)
     va_ds = DemandDataset(data, history, horizon, "val", horizon)
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
-    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, pin_memory=(DEVICE.type == "cuda"))
+    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, pin_memory=(DEVICE.type == "cuda"))
     if len(tr_ds) == 0 or len(va_ds) == 0:
         raise RuntimeError("No train/validation samples. Check history/horizon and data length.")
 
@@ -6485,8 +6581,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     continue_on_error=True,
 # )
 #
-# All-ASIN run (no sampling -- n_asins=None uses every ASIN in each cut,
-# everything else identical to the full rolling run above):
+# All-ASIN run (no sampling -- n_asins=None uses every ASIN in each cut).
+# Uses its own output_root, separate from the n_asins=5000 runs above, so
+# resume_existing=True can never load a cached per-cut result that was
+# actually trained on the 5000-ASIN sample -- each output_root is its own
+# independent cache namespace, keyed only by data_cut, not by n_asins:
 #
 # rolling_joint_h3_all_asins = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=None,
@@ -6500,70 +6599,90 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+#     output_root="joint_true_rolling_h3_all_asins",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
+
+
+# =====================================================
+# Permutation importance for stock_extra__* context features
+# =====================================================
+def permutation_importance_for_stock_extra(model, va_ld, context_cols, n_repeats=3, M=50, seed=0):
+    """
+    Permutation importance, scoped to the stock_extra__* columns in
+    future_context (price, promo, reviews, package dims, category codes,
+    social/popularity, etc -- everything _select_stock_decoder_extra_cols
+    picked out).
+
+    For each such feature: shuffle its values across the batch (breaking the
+    real feature<->outcome relationship while leaving every other input
+    untouched), re-run model.predict, and measure how much worse P50 WAPE
+    gets vs the unshuffled baseline. Repeated n_repeats times per feature to
+    average out shuffle noise.
+
+    Read the output as: delta_wape close to 0 (or negative) = the model
+    barely uses this feature, a reasonable drop candidate. Large positive
+    delta_wape = the model leans on it, keep it.
+    """
+    target_cols = [c for c in context_cols if c.startswith("stock_extra__")]
+    if not target_cols:
+        print("No stock_extra__* columns found in context_cols.")
+        return pd.DataFrame()
+
+    col_idx = {c: context_cols.index(c) for c in target_cols}
+    model = model.to(DEVICE)
+    model.eval()
+
+    def _wape(perm_col=None, gen=None):
+        num, den = 0.0, 0.0
+        with torch.no_grad():
+            for b in va_ld:
+                b = _move_batch_to_device(b, DEVICE)
+                fc = b["future_context"].clone()
+                if perm_col is not None:
+                    j = col_idx[perm_col]
+                    Bn, H, _ = fc.shape
+                    flat = fc[:, :, j].reshape(-1)
+                    perm_idx = torch.randperm(flat.numel(), generator=gen, device="cpu").to(flat.device)
+                    fc[:, :, j] = flat[perm_idx].reshape(Bn, H)
+                p50, p70, p90, exp_hat = model.predict(b["x"], fc, M=M)
+                num += (p50 - b["y"]).abs().sum().item()
+                den += b["y"].abs().sum().item()
+        return num / max(den, 1e-8)
+
+    base_wape = _wape(None)
+    rows = [{"feature": "(baseline, no permutation)", "wape": base_wape,
+             "delta_wape": 0.0, "delta_wape_std": 0.0}]
+
+    for i, c in enumerate(target_cols):
+        deltas = []
+        for r in range(n_repeats):
+            gen = torch.Generator().manual_seed(seed * 10_000 + i * 100 + r)
+            w = _wape(c, gen=gen)
+            deltas.append(w - base_wape)
+        rows.append({
+            "feature": c,
+            "wape": base_wape + float(np.mean(deltas)),
+            "delta_wape": float(np.mean(deltas)),
+            "delta_wape_std": float(np.std(deltas)),
+        })
+
+    df = pd.DataFrame(rows)
+    df = pd.concat([
+        df.iloc[[0]],
+        df.iloc[1:].sort_values("delta_wape", ascending=False),
+    ]).reset_index(drop=True)
+    return df
+
+
+# Usage (after a run_joint_exposure_demand_h3_end2end call, e.g. `result`):
 #
-# Smoke test (2 cuts, small epochs, no cache reuse -- confirms the full
-# pipeline runs end to end: S3 read, ASIN intersection, GPU, the fixed
-# week-alignment assertion, boss WAPE, P90, exposure diagnostics):
-#
-# rolling_joint_h3_smoke = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000,
-#     seed=42,
-#     max_snapshots=2,
-#     select_latest=False,
-#     epochs=3,
-#     patience=2,
-#     history=52,
-#     horizon=3,
-#     batch_size=64,
-#     lambda_under=0.15,
-#     lambda_over=0.0,
-#     lambda_exposure=0.50,
-#     detach_exposure_for_demand=False,
-#     output_root="joint_h3_smoke_test_2cuts",
-#     resume_existing=False,
-#     continue_on_error=False,
+# importance_df = permutation_importance_for_stock_extra(
+#     model=result["model"],
+#     va_ld=result["va_ld"],
+#     context_cols=result["context_cols"],
+#     n_repeats=3,
+#     M=50,
 # )
-#
-# Under/over-forecast loss ablation (2 cuts each, 4 combinations of
-# lambda_under x lambda_over, separate output_root per combo so results
-# don't collide):
-#
-# rolling_ablation_00 = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000, seed=42, max_snapshots=2, select_latest=False,
-#     epochs=20, patience=4, history=52, horizon=3, batch_size=64,
-#     lambda_under=0.0, lambda_over=0.0, lambda_exposure=0.50,
-#     detach_exposure_for_demand=False,
-#     output_root="joint_h3_ablation_under0_over0",
-#     resume_existing=False, continue_on_error=False,
-# )
-#
-# rolling_ablation_10 = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000, seed=42, max_snapshots=2, select_latest=False,
-#     epochs=20, patience=4, history=52, horizon=3, batch_size=64,
-#     lambda_under=0.15, lambda_over=0.0, lambda_exposure=0.50,
-#     detach_exposure_for_demand=False,
-#     output_root="joint_h3_ablation_under15_over0",
-#     resume_existing=False, continue_on_error=False,
-# )
-#
-# rolling_ablation_01 = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000, seed=42, max_snapshots=2, select_latest=False,
-#     epochs=20, patience=4, history=52, horizon=3, batch_size=64,
-#     lambda_under=0.0, lambda_over=0.15, lambda_exposure=0.50,
-#     detach_exposure_for_demand=False,
-#     output_root="joint_h3_ablation_under0_over15",
-#     resume_existing=False, continue_on_error=False,
-# )
-#
-# rolling_ablation_11 = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000, seed=42, max_snapshots=2, select_latest=False,
-#     epochs=20, patience=4, history=52, horizon=3, batch_size=64,
-#     lambda_under=0.15, lambda_over=0.15, lambda_exposure=0.50,
-#     detach_exposure_for_demand=False,
-#     output_root="joint_h3_ablation_under15_over15",
-#     resume_existing=False, continue_on_error=False,
-# )
+# print(importance_df.to_string(index=False))
