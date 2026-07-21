@@ -5848,6 +5848,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
     resume_existing=True,
     continue_on_error=True,
+    compute_feature_importance=False,
+    feature_importance_n_repeats=3,
+    feature_importance_M=50,
     bucket=ROLLING_S3_BUCKET,
     data_prefix=ROLLING_DATA_PREFIX,
     scot_prefix=ROLLING_SCOT_PREFIX,
@@ -5943,6 +5946,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     all_exposure_overall = []
     all_exposure_by_horizon = []
     all_exposure_by_cut_horizon = []
+    all_feature_importance = []
 
     for run_index, row in pairs.iterrows():
         data_cut = pd.Timestamp(row["data_cut"])
@@ -6160,6 +6164,14 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     "p90_penalty_diff"
                 )
 
+                if compute_feature_importance:
+                    print(
+                        f"Feature importance skipped for CUT={data_cut.date()}: "
+                        "loaded from cache, no live model to run predict() on. "
+                        "Set resume_existing=False (or clear this cut's cache) "
+                        "to force retraining and get feature importance for it."
+                    )
+
                 result = None
                 status = "loaded_existing"
 
@@ -6318,6 +6330,26 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 metrics["p90_penalty_diff"] = real_scot.get(
                     "p90_penalty_diff"
                 )
+
+                if compute_feature_importance:
+                    # Only possible here (freshly trained) -- the
+                    # loaded_existing branch above has no live model object,
+                    # only cached CSV outputs, so it cannot run predict().
+                    importance_df = permutation_importance_for_stock_extra(
+                        model=result["model"],
+                        va_ld=result["va_ld"],
+                        context_cols=result["context_cols"],
+                        n_repeats=feature_importance_n_repeats,
+                        M=feature_importance_M,
+                    )
+                    importance_df["data_cut"] = data_cut
+                    importance_df.to_csv(
+                        per_cut_dir / f"feature_importance_cut_{cut_token}.csv",
+                        index=False,
+                    )
+                    all_feature_importance.append(importance_df)
+                    print(f"\nFEATURE IMPORTANCE (stock_extra__*) | CUT={data_cut.date()}")
+                    print(importance_df.to_string(index=False))
 
                 status = "trained"
 
@@ -6511,6 +6543,15 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             "by_cut_horizon": pd.DataFrame(),
         }
 
+    if all_feature_importance:
+        combined_feature_importance = pd.concat(all_feature_importance, ignore_index=True)
+        combined_feature_importance.to_csv(
+            output_root / "feature_importance_full.csv",
+            index=False,
+        )
+    else:
+        combined_feature_importance = pd.DataFrame()
+
     print("\n" + "=" * 88)
     print("ROLLING RUN COMPLETE")
     print("=" * 88)
@@ -6528,6 +6569,12 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         "Full aligned SCOT:",
         output_root / "joint_h3_scot_aligned_full.csv",
     )
+    if compute_feature_importance:
+        print(
+            "Feature importance:",
+            output_root / "feature_importance_full.csv"
+            if all_feature_importance else "(no freshly-trained cuts to compute it on)",
+        )
 
     return {
         "summary": summary_df,
@@ -6536,6 +6583,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         "exposure_hat_overall_by_cut": exposure_overall_full,
         "exposure_hat_by_cut_and_horizon": exposure_by_horizon_full,
         "exposure_hat_full_diagnostics": combined_exposure_diag,
+        "feature_importance": combined_feature_importance,
         "snapshot_pairs": pairs,
         "output_root": str(output_root),
     }
@@ -6561,6 +6609,32 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
+#
+# Feature importance (stock_extra__*), 2 cuts. Uses its own output_root and
+# resume_existing=False -- feature importance needs a freshly trained model
+# per cut (the loaded_existing/cache branch has no live model to run
+# predict() on), so this must not be allowed to hit any prior cache:
+#
+# rolling_joint_h3_importance = run_joint_h3_s3_rolling_scot_p50_p70(
+#     n_asins=5000,
+#     seed=42,
+#     max_snapshots=2,
+#     select_latest=False,
+#     epochs=20,
+#     patience=4,
+#     history=52,
+#     horizon=3,
+#     batch_size=64,
+#     lambda_exposure=0.50,
+#     detach_exposure_for_demand=False,
+#     output_root="joint_h3_feature_importance_2cuts",
+#     resume_existing=False,
+#     continue_on_error=False,
+#     compute_feature_importance=True,
+#     feature_importance_n_repeats=3,
+#     feature_importance_M=50,
+# )
+# print(rolling_joint_h3_importance["feature_importance"].to_string(index=False))
 #
 # Full rolling run after the test succeeds:
 #
