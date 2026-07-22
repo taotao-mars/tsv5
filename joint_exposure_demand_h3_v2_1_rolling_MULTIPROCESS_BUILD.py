@@ -611,6 +611,160 @@ def _zero_streak(active):
     return out
 
 
+
+# -----------------------------------------------------------------------------
+# Four-process per-ASIN feature construction for load_real_data.
+# The sorted DataFrame is inherited by forked workers through copy-on-write.
+# Each worker receives only a contiguous row range, avoiding per-ASIN task queues.
+# -----------------------------------------------------------------------------
+_MP_LOAD_FEATURE_DF = None
+_MP_LOAD_CONTEXT_COLS = None
+_MP_LOAD_DPH_PROXY_COLS = None
+
+
+def _build_one_asin_feature_record(asin, group, context_cols, dph_proxy_cols):
+    """Build one ASIN record with the same feature logic as the serial version."""
+    # The parent DataFrame is already sorted by ASIN and Week. A group slice has a
+    # fresh positional index only when needed; most operations use NumPy directly.
+    demand = group["Demand"].to_numpy(dtype=float, copy=False)
+    oos = group["OOS"].to_numpy(dtype=float, copy=False)
+    weeks = group["Week"].to_numpy(copy=False)
+    t = group["t"].to_numpy(copy=False)
+    T = len(demand)
+
+    v_t = np.log1p(demand)
+    b_t = (demand > 0).astype(float)
+
+    d_t = np.zeros(T)
+    last = -1
+    for i in range(T):
+        if b_t[i] > 0:
+            last = i
+        d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
+
+    in_stock_lag = group["in_stock_dph"].to_numpy(dtype=float, copy=False)
+    instock_raw = group["in_stock_dph"].to_numpy(dtype=float, copy=False)
+    price_log = group["our_price"].to_numpy(dtype=float, copy=False)
+    price_raw = group["our_price_raw"].to_numpy(dtype=float, copy=False)
+    pkg_volume_raw = group["pkg_volume_raw"].to_numpy(dtype=float, copy=False)
+    total_dph_raw = group["total_dph"].to_numpy(dtype=float, copy=False)
+    buy_box_dph_raw = group["buy_box_dph"].to_numpy(dtype=float, copy=False)
+
+    hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
+    hist_nonzero_p75_52 = _rolling_positive_quantile(demand, 52, 0.75)
+    recent_peak_13 = _rolling_max_lag(demand, 13)
+
+    active_rate_4 = _rolling_mean(b_t, 4)
+    active_rate_13 = _rolling_mean(b_t, 13)
+    oos_rate_4 = _rolling_mean(oos, 4)
+    oos_rate_13 = _rolling_mean(oos, 13)
+    instock_mean_4 = _rolling_mean(in_stock_lag, 4)
+    instock_mean_13 = _rolling_mean(in_stock_lag, 13)
+
+    total_dph_mean_4 = _rolling_mean(total_dph_raw, 4)
+    total_dph_mean_13 = _rolling_mean(total_dph_raw, 13)
+    buy_box_dph_mean_4 = _rolling_mean(buy_box_dph_raw, 4)
+    buy_box_dph_mean_13 = _rolling_mean(buy_box_dph_raw, 13)
+
+    buy_box_rate = np.clip(buy_box_dph_raw / (total_dph_raw + 1.0), 0.0, 10.0)
+    in_stock_rate = np.clip(instock_raw / (total_dph_raw + 1.0), 0.0, 10.0)
+    in_stock_given_buybox = np.clip(instock_raw / (buy_box_dph_raw + 1.0), 0.0, 10.0)
+
+    zero_streak = _zero_streak(b_t) / 52.0
+    positive_mean_4 = _rolling_positive_mean(demand, 4)
+    positive_mean_13 = _rolling_positive_mean(demand, 13)
+    positive_max_13 = _rolling_max_lag(demand, 13)
+    positive_std_13 = _rolling_std(np.log1p(demand), 13)
+
+    features = np.stack([
+        v_t,
+        b_t,
+        d_t,
+        np.sin(2 * np.pi * t / 52),
+        np.cos(2 * np.pi * t / 52),
+        group["promo_t"].to_numpy(dtype=float, copy=False),
+        np.sin(2 * np.pi * t / 13),
+        np.cos(2 * np.pi * t / 13),
+        np.log1p(hist_nonzero_mean_52),
+        np.log1p(hist_nonzero_p75_52),
+        np.log1p(recent_peak_13),
+        np.log1p(in_stock_lag),
+        oos,
+        active_rate_4,
+        active_rate_13,
+        oos_rate_4,
+        oos_rate_13,
+        np.log1p(instock_mean_4),
+        np.log1p(instock_mean_13),
+        zero_streak,
+        price_log,
+        np.log1p(positive_mean_4),
+        np.log1p(positive_mean_13),
+        np.log1p(positive_max_13),
+        positive_std_13,
+        np.log1p(total_dph_raw),
+        np.log1p(buy_box_dph_raw),
+        np.log1p(total_dph_mean_4),
+        np.log1p(total_dph_mean_13),
+        np.log1p(buy_box_dph_mean_4),
+        np.log1p(buy_box_dph_mean_13),
+        buy_box_rate,
+        in_stock_rate,
+        in_stock_given_buybox,
+    ], axis=1).astype(np.float32)
+
+    future_context = group[context_cols].to_numpy(dtype=np.float32, copy=True)
+    return asin, {
+        "features": features,
+        "future_context": future_context,
+        "demand": demand.astype(np.float32),
+        "week": weeks,
+        "oos": oos.astype(np.float32),
+        "price_raw": price_raw.astype(np.float32),
+        "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
+        "instock_raw": instock_raw.astype(np.float32),
+        "total_dph_raw": total_dph_raw.astype(np.float32),
+        "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
+        "dph_proxy_context_idx": {
+            c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
+        },
+    }
+
+
+def _mp_load_feature_chunk_worker(task):
+    """Process one contiguous ASIN-aligned row chunk inherited through fork."""
+    worker_id, row_start, row_end, expected_asins = task
+    global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+    t0 = time.perf_counter()
+    print(
+        f"[LOAD-W{worker_id}] START | rows={row_end-row_start:,} | "
+        f"expected_asins={expected_asins:,}",
+        flush=True,
+    )
+    chunk = _MP_LOAD_FEATURE_DF.iloc[row_start:row_end]
+    out = {}
+    for i, (asin, group) in enumerate(chunk.groupby("ASIN", sort=False), start=1):
+        asin_key, record = _build_one_asin_feature_record(
+            asin, group, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+        )
+        out[asin_key] = record
+        if i == 1 or i % 1000 == 0 or i == expected_asins:
+            elapsed = time.perf_counter() - t0
+            rate = i / max(elapsed, 1e-9)
+            eta = (expected_asins - i) / max(rate, 1e-9)
+            print(
+                f"[LOAD-W{worker_id}] {i:,}/{expected_asins:,} "
+                f"({100*i/max(expected_asins,1):.1f}%) | "
+                f"elapsed={elapsed/60:.1f}m | ETA={eta/60:.1f}m",
+                flush=True,
+            )
+    print(
+        f"[LOAD-W{worker_id}] DONE | asins={len(out):,} | "
+        f"elapsed={(time.perf_counter()-t0)/60:.2f}m",
+        flush=True,
+    )
+    return worker_id, out
+
 def load_real_data(data_raw, dph_cap_q=0.995):
     _stage_t0 = time.perf_counter()
     print(f"[STAGE] load_real_data START | rows={len(data_raw):,} | asins={data_raw['asin'].nunique() if 'asin' in data_raw.columns else 'NA'}", flush=True)
@@ -819,134 +973,112 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     df["t"] = ((df["Week"] - df["Week"].min()).dt.days // 7).astype(int)
 
     data = {}
-    _groups = df.groupby("ASIN", sort=False)
-    _n_asins = df["ASIN"].nunique()
+    _n_asins = int(df["ASIN"].nunique())
     _feat_t0 = time.perf_counter()
-    print(f"[STAGE] per-ASIN feature construction START | {_n_asins:,} ASINs | SERIAL", flush=True)
-    for _asin_i, (asin, group) in enumerate(_groups, start=1):
-        if _asin_i == 1 or _asin_i % 2000 == 0 or _asin_i == _n_asins:
-            _elapsed = time.perf_counter() - _feat_t0
-            _rate = _asin_i / max(_elapsed, 1e-9)
-            _eta = (_n_asins - _asin_i) / max(_rate, 1e-9)
+    _num_load_workers = min(4, max(1, _n_asins))
+    print(
+        f"[LOAD] per-ASIN feature construction START | {_n_asins:,} ASINs | "
+        f"requested_workers={_num_load_workers}",
+        flush=True,
+    )
+
+    # Since df is sorted by ASIN, compute ASIN-aligned contiguous row chunks.
+    _boundary_t0 = time.perf_counter()
+    _asin_values = df["ASIN"].to_numpy(copy=False)
+    _change_pos = np.flatnonzero(_asin_values[1:] != _asin_values[:-1]) + 1
+    _group_starts = np.r_[0, _change_pos]
+    _group_ends = np.r_[_change_pos, len(df)]
+    _asin_index_chunks = np.array_split(np.arange(_n_asins), _num_load_workers)
+    _tasks = []
+    for _wid, _idx_chunk in enumerate(_asin_index_chunks):
+        if len(_idx_chunk) == 0:
+            continue
+        _row_start = int(_group_starts[int(_idx_chunk[0])])
+        _row_end = int(_group_ends[int(_idx_chunk[-1])])
+        _tasks.append((_wid, _row_start, _row_end, int(len(_idx_chunk))))
+        print(
+            f"[LOAD] worker {_wid}: rows={_row_end-_row_start:,} | "
+            f"asins={len(_idx_chunk):,}",
+            flush=True,
+        )
+    print(
+        f"[LOAD] chunk planning DONE | elapsed={time.perf_counter()-_boundary_t0:.2f}s",
+        flush=True,
+    )
+
+    _used_parallel = False
+    if len(_tasks) > 1:
+        try:
+            _current_start = mp.get_start_method(allow_none=True)
+            if _current_start == "spawn":
+                raise RuntimeError(
+                    "spawn start method would pickle the full DataFrame; using serial fallback"
+                )
+            global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+            _MP_LOAD_FEATURE_DF = df
+            _MP_LOAD_CONTEXT_COLS = context_cols
+            _MP_LOAD_DPH_PROXY_COLS = dph_proxy_cols
             print(
-                f"[PROGRESS] per-ASIN features {_asin_i:,}/{_n_asins:,} "
-                f"({100*_asin_i/max(_n_asins,1):.1f}%) | elapsed={_elapsed/60:.1f}m | ETA={_eta/60:.1f}m",
+                f"[LOAD] launching {len(_tasks)} fork workers...",
                 flush=True,
             )
-        group = group.reset_index(drop=True)
-        demand = group["Demand"].values.astype(float)
-        oos    = group["OOS"].values.astype(float)
-        weeks  = group["Week"].values
-        t      = group["t"].values
-        T      = len(demand)
+            _pool_t0 = time.perf_counter()
+            _ctx = mp.get_context("fork")
+            with _ctx.Pool(processes=len(_tasks)) as _pool:
+                _parts = _pool.map(_mp_load_feature_chunk_worker, _tasks)
+            print(
+                f"[LOAD] workers RETURNED | elapsed={(time.perf_counter()-_pool_t0)/60:.2f}m",
+                flush=True,
+            )
 
-        v_t = np.log1p(demand)
-        b_t = (demand > 0).astype(float)
+            _merge_t0 = time.perf_counter()
+            print("[LOAD] merging worker outputs START", flush=True)
+            for _wid, _part in sorted(_parts, key=lambda x: x[0]):
+                data.update(_part)
+                print(
+                    f"[LOAD] merged worker {_wid} | part_asins={len(_part):,} | "
+                    f"total={len(data):,}",
+                    flush=True,
+                )
+            print(
+                f"[LOAD] merging worker outputs DONE | elapsed={time.perf_counter()-_merge_t0:.2f}s",
+                flush=True,
+            )
+            _used_parallel = True
+        except Exception as _mp_err:
+            print(
+                f"[LOAD] 4-worker mode failed: {type(_mp_err).__name__}: {_mp_err}",
+                flush=True,
+            )
+            print("[LOAD] falling back to SERIAL construction", flush=True)
+        finally:
+            _MP_LOAD_FEATURE_DF = None
+            _MP_LOAD_CONTEXT_COLS = None
+            _MP_LOAD_DPH_PROXY_COLS = None
 
-        d_t = np.zeros(T)
-        last = -1
-        for i in range(T):
-            if b_t[i] > 0: last = i
-            d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
+    if not _used_parallel:
+        _serial_t0 = time.perf_counter()
+        for _asin_i, (asin, group) in enumerate(df.groupby("ASIN", sort=False), start=1):
+            asin_key, record = _build_one_asin_feature_record(
+                asin, group, context_cols, dph_proxy_cols
+            )
+            data[asin_key] = record
+            if _asin_i == 1 or _asin_i % 2000 == 0 or _asin_i == _n_asins:
+                _elapsed = time.perf_counter() - _serial_t0
+                _rate = _asin_i / max(_elapsed, 1e-9)
+                _eta = (_n_asins - _asin_i) / max(_rate, 1e-9)
+                print(
+                    f"[LOAD-SERIAL] {_asin_i:,}/{_n_asins:,} "
+                    f"({100*_asin_i/max(_n_asins,1):.1f}%) | "
+                    f"elapsed={_elapsed/60:.1f}m | ETA={_eta/60:.1f}m",
+                    flush=True,
+                )
 
-        in_stock_lag = group["in_stock_dph"].values.astype(float)
-        instock_raw  = group["in_stock_dph"].values.astype(float)
-        price_log    = group["our_price"].values.astype(float)
-        price_raw    = group["our_price_raw"].values.astype(float)
-        pkg_volume_raw = group["pkg_volume_raw"].values.astype(float)
-        total_dph_raw = group["total_dph"].values.astype(float)
-        buy_box_dph_raw = group["buy_box_dph"].values.astype(float)
-
-        # All rolling features now exclude current step (leak-free)
-        hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
-        hist_nonzero_p75_52  = _rolling_positive_quantile(demand, 52, 0.75)
-        recent_peak_13       = _rolling_max_lag(demand, 13)
-
-        active_rate_4   = _rolling_mean(b_t, 4)
-        active_rate_13  = _rolling_mean(b_t, 13)
-        oos_rate_4      = _rolling_mean(oos, 4)
-        oos_rate_13     = _rolling_mean(oos, 13)
-        instock_mean_4  = _rolling_mean(in_stock_lag, 4)
-        instock_mean_13 = _rolling_mean(in_stock_lag, 13)
-
-        total_dph_mean_4  = _rolling_mean(total_dph_raw, 4)
-        total_dph_mean_13 = _rolling_mean(total_dph_raw, 13)
-        buy_box_dph_mean_4  = _rolling_mean(buy_box_dph_raw, 4)
-        buy_box_dph_mean_13 = _rolling_mean(buy_box_dph_raw, 13)
-
-        buy_box_rate = buy_box_dph_raw / (total_dph_raw + 1.0)
-        in_stock_rate = instock_raw / (total_dph_raw + 1.0)
-        in_stock_given_buybox = instock_raw / (buy_box_dph_raw + 1.0)
-
-        buy_box_rate = np.clip(buy_box_rate, 0.0, 10.0)
-        in_stock_rate = np.clip(in_stock_rate, 0.0, 10.0)
-        in_stock_given_buybox = np.clip(in_stock_given_buybox, 0.0, 10.0)
-
-        zero_streak     = _zero_streak(b_t) / 52.0
-
-        positive_mean_4  = _rolling_positive_mean(demand, 4)
-        positive_mean_13 = _rolling_positive_mean(demand, 13)
-        positive_max_13  = _rolling_max_lag(demand, 13)
-        positive_std_13  = _rolling_std(np.log1p(demand), 13)
-
-        features = np.stack([
-            v_t,
-            b_t,
-            d_t,
-            np.sin(2 * np.pi * t / 52),
-            np.cos(2 * np.pi * t / 52),
-            group["promo_t"].values.astype(float),
-            np.sin(2 * np.pi * t / 13),
-            np.cos(2 * np.pi * t / 13),
-            np.log1p(hist_nonzero_mean_52),   # 8
-            np.log1p(hist_nonzero_p75_52),    # 9
-            np.log1p(recent_peak_13),         # 10
-            np.log1p(in_stock_lag),
-            oos,
-            active_rate_4,
-            active_rate_13,
-            oos_rate_4,
-            oos_rate_13,
-            np.log1p(instock_mean_4),
-            np.log1p(instock_mean_13),
-            zero_streak,
-            price_log,
-            np.log1p(positive_mean_4),
-            np.log1p(positive_mean_13),
-            np.log1p(positive_max_13),
-            positive_std_13,
-
-            np.log1p(total_dph_raw),
-            np.log1p(buy_box_dph_raw),
-            np.log1p(total_dph_mean_4),
-            np.log1p(total_dph_mean_13),
-            np.log1p(buy_box_dph_mean_4),
-            np.log1p(buy_box_dph_mean_13),
-            buy_box_rate,
-            in_stock_rate,
-            in_stock_given_buybox,
-        ], axis=1).astype(np.float32)
-
-        future_context = group[context_cols].values.astype(np.float32)
-
-
-        data[asin] = {
-            "features": features,
-            "future_context": future_context,
-            "demand": demand.astype(np.float32),
-            "week": weeks,
-            "oos": oos.astype(np.float32),
-            "price_raw": price_raw.astype(np.float32),
-            "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
-            "instock_raw": instock_raw.astype(np.float32),
-            "total_dph_raw": total_dph_raw.astype(np.float32),
-            "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
-            "dph_proxy_context_idx": {
-                c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
-            },
-        }
-
-    print(f"[STAGE] per-ASIN feature construction DONE | {(time.perf_counter()-_feat_t0)/60:.2f} min", flush=True)
+    print(
+        f"[LOAD] per-ASIN feature construction DONE | mode={'4-worker' if _used_parallel else 'serial'} | "
+        f"asins={len(data):,} | elapsed={(time.perf_counter()-_feat_t0)/60:.2f}m",
+        flush=True,
+    )
     print(f"[STAGE] load_real_data DONE | {(time.perf_counter()-_stage_t0)/60:.2f} min", flush=True)
     print("History encoder dim: 34")
     print(f"Package dimension columns for total_size: {pkg_cols}")
@@ -2122,93 +2254,17 @@ def magnitude_gap(diag_df):
 # =====================================================
 
 def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
-    """Remove ASINs whose maximum cleaned demand exceeds the global positive-demand quantile.
-
-    This keeps the original filtering rule and return format, while avoiding an
-    unnecessary full-DataFrame copy at the beginning.  It does not modify
-    ``data_high`` or any S3 object.
-    """
-    t_total = time.perf_counter()
-    n_rows = len(data_high)
-    n_asins = data_high[asin_col].nunique(dropna=True)
-    print(
-        f"\n[EXTREME] START | rows={n_rows:,} | asins={n_asins:,} | "
-        f"demand_col={demand_col} | q={q}",
-        flush=True,
-    )
-
-    # 1) Clean only the demand Series; do not copy the entire DataFrame.
-    t = time.perf_counter()
-    print(
-        f"[EXTREME] demand cleaning START | dtype={data_high[demand_col].dtype}",
-        flush=True,
-    )
-    demand_clean = (
-        pd.to_numeric(data_high[demand_col], errors="coerce")
-        .fillna(0)
-        .clip(lower=0)
-    )
-    print(
-        f"[EXTREME] demand cleaning DONE | elapsed={time.perf_counter() - t:.2f}s | "
-        f"positive_rows={(demand_clean > 0).sum():,}",
-        flush=True,
-    )
-
-    # 2) Compute the same quantile as the original implementation.
-    t = time.perf_counter()
-    print("[EXTREME] positive quantile START", flush=True)
-    positive_mask = demand_clean > 0
-    if not positive_mask.any():
-        clean = data_high.copy()
-        clean[demand_col] = demand_clean
-        print(
-            f"[EXTREME] no positive demand | returning all rows | "
-            f"total_elapsed={time.perf_counter() - t_total:.2f}s",
-            flush=True,
-        )
-        return clean, pd.DataFrame(), np.nan
-
-    cap = float(demand_clean.loc[positive_mask].quantile(q))
-    print(
-        f"[EXTREME] positive quantile DONE | cap={cap:.6g} | "
-        f"elapsed={time.perf_counter() - t:.2f}s",
-        flush=True,
-    )
-
-    # 3) Per-ASIN maximum, preserving the original pandas groupby ordering.
-    t = time.perf_counter()
-    print("[EXTREME] groupby max START", flush=True)
-    asin_peak_series = demand_clean.groupby(data_high[asin_col]).max()
-    asin_peak = asin_peak_series.reset_index(name="asin_max")
-    bad_mask = asin_peak["asin_max"] > cap
-    bad_asins = asin_peak.loc[bad_mask, asin_col]
-    removed = asin_peak.loc[bad_mask].copy()
-    print(
-        f"[EXTREME] groupby max DONE | grouped_asins={len(asin_peak):,} | "
-        f"bad_asins={bad_asins.nunique():,} | elapsed={time.perf_counter() - t:.2f}s",
-        flush=True,
-    )
-
-    # 4) Filter once, then place the already-cleaned demand values into the copy.
-    t = time.perf_counter()
-    print("[EXTREME] final isin/filter/copy START", flush=True)
-    keep_mask = ~data_high[asin_col].isin(bad_asins)
-    clean = data_high.loc[keep_mask].copy()
-    clean[demand_col] = demand_clean.loc[keep_mask].to_numpy()
-    clean_asins = clean[asin_col].nunique(dropna=True)
-    print(
-        f"[EXTREME] final isin/filter/copy DONE | kept_rows={len(clean):,} | "
-        f"kept_asins={clean_asins:,} | removed_rows={n_rows - len(clean):,} | "
-        f"elapsed={time.perf_counter() - t:.2f}s",
-        flush=True,
-    )
-
-    print(
-        f"[EXTREME] END | p{int(q * 100)}={cap:.1f} | "
-        f"removed_asins={bad_asins.nunique():,} | total_elapsed={time.perf_counter() - t_total:.2f}s",
-        flush=True,
-    )
-    return clean, removed, cap
+    df = data_high.copy()
+    df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce").fillna(0).clip(lower=0)
+    pos = df.loc[df[demand_col]>0, demand_col]
+    if len(pos) == 0: return df, pd.DataFrame(), np.nan
+    cap = float(pos.quantile(q))
+    asin_peak = df.groupby(asin_col)[demand_col].max().reset_index(name="asin_max")
+    bad_asins = asin_peak.loc[asin_peak["asin_max"]>cap, asin_col]
+    clean = df[~df[asin_col].isin(bad_asins)].copy()
+    print(f"\nExtreme ASIN filter (p{int(q*100)}={cap:.1f}): removed {bad_asins.nunique()} ASINs")
+    print(f"Clean ASINs: {clean[asin_col].nunique()} | Clean rows: {len(clean)}")
+    return clean, asin_peak[asin_peak[asin_col].isin(bad_asins)], cap
 
 
 def run_nb_high_sparse(
