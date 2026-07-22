@@ -2122,17 +2122,93 @@ def magnitude_gap(diag_df):
 # =====================================================
 
 def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
-    df = data_high.copy()
-    df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce").fillna(0).clip(lower=0)
-    pos = df.loc[df[demand_col]>0, demand_col]
-    if len(pos) == 0: return df, pd.DataFrame(), np.nan
-    cap = float(pos.quantile(q))
-    asin_peak = df.groupby(asin_col)[demand_col].max().reset_index(name="asin_max")
-    bad_asins = asin_peak.loc[asin_peak["asin_max"]>cap, asin_col]
-    clean = df[~df[asin_col].isin(bad_asins)].copy()
-    print(f"\nExtreme ASIN filter (p{int(q*100)}={cap:.1f}): removed {bad_asins.nunique()} ASINs")
-    print(f"Clean ASINs: {clean[asin_col].nunique()} | Clean rows: {len(clean)}")
-    return clean, asin_peak[asin_peak[asin_col].isin(bad_asins)], cap
+    """Remove ASINs whose maximum cleaned demand exceeds the global positive-demand quantile.
+
+    This keeps the original filtering rule and return format, while avoiding an
+    unnecessary full-DataFrame copy at the beginning.  It does not modify
+    ``data_high`` or any S3 object.
+    """
+    t_total = time.perf_counter()
+    n_rows = len(data_high)
+    n_asins = data_high[asin_col].nunique(dropna=True)
+    print(
+        f"\n[EXTREME] START | rows={n_rows:,} | asins={n_asins:,} | "
+        f"demand_col={demand_col} | q={q}",
+        flush=True,
+    )
+
+    # 1) Clean only the demand Series; do not copy the entire DataFrame.
+    t = time.perf_counter()
+    print(
+        f"[EXTREME] demand cleaning START | dtype={data_high[demand_col].dtype}",
+        flush=True,
+    )
+    demand_clean = (
+        pd.to_numeric(data_high[demand_col], errors="coerce")
+        .fillna(0)
+        .clip(lower=0)
+    )
+    print(
+        f"[EXTREME] demand cleaning DONE | elapsed={time.perf_counter() - t:.2f}s | "
+        f"positive_rows={(demand_clean > 0).sum():,}",
+        flush=True,
+    )
+
+    # 2) Compute the same quantile as the original implementation.
+    t = time.perf_counter()
+    print("[EXTREME] positive quantile START", flush=True)
+    positive_mask = demand_clean > 0
+    if not positive_mask.any():
+        clean = data_high.copy()
+        clean[demand_col] = demand_clean
+        print(
+            f"[EXTREME] no positive demand | returning all rows | "
+            f"total_elapsed={time.perf_counter() - t_total:.2f}s",
+            flush=True,
+        )
+        return clean, pd.DataFrame(), np.nan
+
+    cap = float(demand_clean.loc[positive_mask].quantile(q))
+    print(
+        f"[EXTREME] positive quantile DONE | cap={cap:.6g} | "
+        f"elapsed={time.perf_counter() - t:.2f}s",
+        flush=True,
+    )
+
+    # 3) Per-ASIN maximum, preserving the original pandas groupby ordering.
+    t = time.perf_counter()
+    print("[EXTREME] groupby max START", flush=True)
+    asin_peak_series = demand_clean.groupby(data_high[asin_col]).max()
+    asin_peak = asin_peak_series.reset_index(name="asin_max")
+    bad_mask = asin_peak["asin_max"] > cap
+    bad_asins = asin_peak.loc[bad_mask, asin_col]
+    removed = asin_peak.loc[bad_mask].copy()
+    print(
+        f"[EXTREME] groupby max DONE | grouped_asins={len(asin_peak):,} | "
+        f"bad_asins={bad_asins.nunique():,} | elapsed={time.perf_counter() - t:.2f}s",
+        flush=True,
+    )
+
+    # 4) Filter once, then place the already-cleaned demand values into the copy.
+    t = time.perf_counter()
+    print("[EXTREME] final isin/filter/copy START", flush=True)
+    keep_mask = ~data_high[asin_col].isin(bad_asins)
+    clean = data_high.loc[keep_mask].copy()
+    clean[demand_col] = demand_clean.loc[keep_mask].to_numpy()
+    clean_asins = clean[asin_col].nunique(dropna=True)
+    print(
+        f"[EXTREME] final isin/filter/copy DONE | kept_rows={len(clean):,} | "
+        f"kept_asins={clean_asins:,} | removed_rows={n_rows - len(clean):,} | "
+        f"elapsed={time.perf_counter() - t:.2f}s",
+        flush=True,
+    )
+
+    print(
+        f"[EXTREME] END | p{int(q * 100)}={cap:.1f} | "
+        f"removed_asins={bad_asins.nunique():,} | total_elapsed={time.perf_counter() - t_total:.2f}s",
+        flush=True,
+    )
+    return clean, removed, cap
 
 
 def run_nb_high_sparse(
