@@ -5208,14 +5208,37 @@ def run_joint_exposure_demand_h3_end2end(
     print("Sampled ASINs:", len(sample_asin_df))
     print("ASINs after SCOT intersection:", len(intersect_asin_df))
     print("ASINs before extreme filtering:", data_use["asin"].nunique())
-    print("Sparse groups are diagnostics only; no high_sparse-only filtering.")
+    print("Sparse groups are diagnostics only; no high_sparse-only filtering.", flush=True)
 
+    _stage_t0 = time.time()
+    print(
+        f"[STAGE] extreme filtering START | rows={len(data_use):,} | "
+        f"asins={data_use['asin'].nunique():,} | remove_extreme={remove_extreme} | q={extreme_q}",
+        flush=True,
+    )
     if remove_extreme:
         data_use, removed_extreme, extreme_cap = filter_extreme_asins(data_use, q=extreme_q)
     else:
         removed_extreme, extreme_cap = pd.DataFrame(), np.nan
+    print(
+        f"[STAGE] extreme filtering DONE | rows={len(data_use):,} | "
+        f"asins={data_use['asin'].nunique():,} | removed={len(removed_extreme):,} | "
+        f"cap={extreme_cap} | elapsed={time.time() - _stage_t0:.1f}s",
+        flush=True,
+    )
 
+    _stage_t0 = time.time()
+    print(
+        f"[STAGE] load_real_data CALL | rows={len(data_use):,} | "
+        f"asins={data_use['asin'].nunique():,}",
+        flush=True,
+    )
     data, context_dim, context_cols = load_real_data(data_use, dph_cap_q=0.995)
+    print(
+        f"[STAGE] load_real_data RETURNED | built_asins={len(data):,} | "
+        f"context_dim={context_dim} | elapsed={time.time() - _stage_t0:.1f}s",
+        flush=True,
+    )
     if context_cols[-3:] != EXTERNAL_HAT_COLS:
         raise RuntimeError(
             "load_real_data did not append the reserved exposure-hat "
