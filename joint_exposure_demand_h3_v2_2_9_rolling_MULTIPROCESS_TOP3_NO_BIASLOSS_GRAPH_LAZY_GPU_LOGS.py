@@ -1,4 +1,9 @@
 print("[VERSION] v2_2_9 GRAPH_LAZY_GPU_LOGS", flush=True)
+
+print("\n" + "#" * 96, flush=True)
+print("[VERSION] v2_2_10 PROFILE_CONTEXT62_LAZY_WORKERS ACTIVE", flush=True)
+print("[VERSION] Expected path: base load -> graph wrapper -> lazy dataset -> DataLoader workers", flush=True)
+print("#" * 96 + "\n", flush=True)
 # =====================================================
 # Demand v12c1-FUTURETCN-DECODER-STOPGRAD-Z
 # Based on v12c0-READHAT-NOQ:
@@ -1090,8 +1095,15 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
     print("History encoder includes DPH funnel features")
     print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
-    print(f"Context dim: {len(context_cols)}")
-    return data, len(context_cols), context_cols
+    print(f"Context dim: {len(context_cols)}", flush=True)
+    print("[PROFILE-C62] base load_real_data reached RETURN boundary", flush=True)
+    _ret_t0 = time.perf_counter()
+    _ret_value = (data, len(context_cols), context_cols)
+    print(
+        f"[PROFILE-C62] base return tuple ready | elapsed={time.perf_counter()-_ret_t0:.6f}s",
+        flush=True,
+    )
+    return _ret_value
 
 
 # =====================================================
@@ -4876,11 +4888,23 @@ def _reorder_future_context_keep_hats_last(data, context_cols):
 
 def load_real_data(data_raw, dph_cap_q=0.995):
     _wrapper_t0 = time.perf_counter()
-    print("[STAGE] graph-context wrapper START", flush=True)
+    print("[PROFILE-WRAPPER] graph-context wrapper ENTERED", flush=True)
+    print(
+        f"[PROFILE-WRAPPER] active base loader={getattr(_ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT, '__name__', type(_ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT).__name__)}",
+        flush=True,
+    )
     data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT(data_raw, dph_cap_q=dph_cap_q)
-    print("[STAGE] base load_real_data RETURNED; graph preprocessing START", flush=True)
+    print(
+        f"[PROFILE-WRAPPER] base load_real_data RETURNED | elapsed={(time.perf_counter()-_wrapper_t0)/60:.2f}m",
+        flush=True,
+    )
+    _graph_t0 = time.perf_counter()
+    print("[PROFILE-GRAPH] graph preprocessing START", flush=True)
     data, context_dim, context_cols = _graph_add_context_cols_to_data(data, context_cols, data_raw=data_raw)
-    print("[STAGE] graph preprocessing RETURNED", flush=True)
+    print(
+        f"[PROFILE-GRAPH] graph preprocessing DONE | elapsed={(time.perf_counter()-_graph_t0)/60:.2f}m",
+        flush=True,
+    )
     data, context_dim, context_cols = _reorder_future_context_keep_hats_last(data, context_cols)
     print("\n" + "=" * 100)
     print("PACKAGE-AWARE RELATION GRAPH FEATURES ADDED TO DEMAND FUTURE_CONTEXT")
@@ -5715,10 +5739,30 @@ def run_joint_exposure_demand_h3_end2end(
             "last instead. Check the placeholder column names set above "
             "match the _log-suffixed names load_real_data requires."
         )
+    _ds_t0 = time.perf_counter()
+    print("[PROFILE-DATASET] train lazy dataset START", flush=True)
     tr_ds = DemandDataset(data, history, horizon, "train", horizon, num_build_workers=4)
+    print(
+        f"[PROFILE-DATASET] train lazy dataset DONE | samples={len(tr_ds):,} | elapsed={time.perf_counter()-_ds_t0:.2f}s",
+        flush=True,
+    )
+
+    _ds_t0 = time.perf_counter()
+    print("[PROFILE-DATASET] validation lazy dataset START", flush=True)
     va_ds = DemandDataset(data, history, horizon, "val", horizon, num_build_workers=4)
+    print(
+        f"[PROFILE-DATASET] validation lazy dataset DONE | samples={len(va_ds):,} | elapsed={time.perf_counter()-_ds_t0:.2f}s",
+        flush=True,
+    )
+
+    _loader_t0 = time.perf_counter()
+    print("[PROFILE-LOADER] DataLoader creation START", flush=True)
     tr_ld = make_demand_dataloader(tr_ds, batch_size, True, seed=seed, num_workers=4, name="train")
     va_ld = make_demand_dataloader(va_ds, batch_size, False, seed=seed + 1, num_workers=2, name="val")
+    print(
+        f"[PROFILE-LOADER] DataLoader creation DONE | elapsed={time.perf_counter()-_loader_t0:.2f}s",
+        flush=True,
+    )
     if len(tr_ds) == 0 or len(va_ds) == 0:
         raise RuntimeError("No train/validation samples. Check history/horizon and data length.")
 
