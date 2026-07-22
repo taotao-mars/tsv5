@@ -610,6 +610,143 @@ def _zero_streak(active):
     return out
 
 
+
+
+# =====================================================
+# Multiprocessing for per-ASIN feature construction
+# =====================================================
+_MP_FEATURE_DF = None
+_MP_FEATURE_CONTEXT_COLS = None
+_MP_FEATURE_DPH_PROXY_COLS = None
+
+
+def _build_one_asin_feature_record(asin, group, context_cols, dph_proxy_cols):
+    group = group.reset_index(drop=True)
+    demand = group["Demand"].values.astype(float)
+    oos    = group["OOS"].values.astype(float)
+    weeks  = group["Week"].values
+    t      = group["t"].values
+    T      = len(demand)
+
+    v_t = np.log1p(demand)
+    b_t = (demand > 0).astype(float)
+
+    d_t = np.zeros(T)
+    last = -1
+    for i in range(T):
+        if b_t[i] > 0: last = i
+        d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
+
+    in_stock_lag = group["in_stock_dph"].values.astype(float)
+    instock_raw  = group["in_stock_dph"].values.astype(float)
+    price_log    = group["our_price"].values.astype(float)
+    price_raw    = group["our_price_raw"].values.astype(float)
+    pkg_volume_raw = group["pkg_volume_raw"].values.astype(float)
+    total_dph_raw = group["total_dph"].values.astype(float)
+    buy_box_dph_raw = group["buy_box_dph"].values.astype(float)
+
+    # All rolling features now exclude current step (leak-free)
+    hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
+    hist_nonzero_p75_52  = _rolling_positive_quantile(demand, 52, 0.75)
+    recent_peak_13       = _rolling_max_lag(demand, 13)
+
+    active_rate_4   = _rolling_mean(b_t, 4)
+    active_rate_13  = _rolling_mean(b_t, 13)
+    oos_rate_4      = _rolling_mean(oos, 4)
+    oos_rate_13     = _rolling_mean(oos, 13)
+    instock_mean_4  = _rolling_mean(in_stock_lag, 4)
+    instock_mean_13 = _rolling_mean(in_stock_lag, 13)
+
+    total_dph_mean_4  = _rolling_mean(total_dph_raw, 4)
+    total_dph_mean_13 = _rolling_mean(total_dph_raw, 13)
+    buy_box_dph_mean_4  = _rolling_mean(buy_box_dph_raw, 4)
+    buy_box_dph_mean_13 = _rolling_mean(buy_box_dph_raw, 13)
+
+    buy_box_rate = buy_box_dph_raw / (total_dph_raw + 1.0)
+    in_stock_rate = instock_raw / (total_dph_raw + 1.0)
+    in_stock_given_buybox = instock_raw / (buy_box_dph_raw + 1.0)
+
+    buy_box_rate = np.clip(buy_box_rate, 0.0, 10.0)
+    in_stock_rate = np.clip(in_stock_rate, 0.0, 10.0)
+    in_stock_given_buybox = np.clip(in_stock_given_buybox, 0.0, 10.0)
+
+    zero_streak     = _zero_streak(b_t) / 52.0
+
+    positive_mean_4  = _rolling_positive_mean(demand, 4)
+    positive_mean_13 = _rolling_positive_mean(demand, 13)
+    positive_max_13  = _rolling_max_lag(demand, 13)
+    positive_std_13  = _rolling_std(np.log1p(demand), 13)
+
+    features = np.stack([
+        v_t,
+        b_t,
+        d_t,
+        np.sin(2 * np.pi * t / 52),
+        np.cos(2 * np.pi * t / 52),
+        group["promo_t"].values.astype(float),
+        np.sin(2 * np.pi * t / 13),
+        np.cos(2 * np.pi * t / 13),
+        np.log1p(hist_nonzero_mean_52),   # 8
+        np.log1p(hist_nonzero_p75_52),    # 9
+        np.log1p(recent_peak_13),         # 10
+        np.log1p(in_stock_lag),
+        oos,
+        active_rate_4,
+        active_rate_13,
+        oos_rate_4,
+        oos_rate_13,
+        np.log1p(instock_mean_4),
+        np.log1p(instock_mean_13),
+        zero_streak,
+        price_log,
+        np.log1p(positive_mean_4),
+        np.log1p(positive_mean_13),
+        np.log1p(positive_max_13),
+        positive_std_13,
+
+        np.log1p(total_dph_raw),
+        np.log1p(buy_box_dph_raw),
+        np.log1p(total_dph_mean_4),
+        np.log1p(total_dph_mean_13),
+        np.log1p(buy_box_dph_mean_4),
+        np.log1p(buy_box_dph_mean_13),
+        buy_box_rate,
+        in_stock_rate,
+        in_stock_given_buybox,
+    ], axis=1).astype(np.float32)
+
+    future_context = group[context_cols].values.astype(np.float32)
+
+
+    result = {
+        "features": features,
+        "future_context": future_context,
+        "demand": demand.astype(np.float32),
+        "week": weeks,
+        "oos": oos.astype(np.float32),
+        "price_raw": price_raw.astype(np.float32),
+        "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
+        "instock_raw": instock_raw.astype(np.float32),
+        "total_dph_raw": total_dph_raw.astype(np.float32),
+        "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
+        "dph_proxy_context_idx": {
+            c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
+        },
+    }
+
+
+    return asin, result
+
+
+
+def _mp_feature_worker(task):
+    """Build one ASIN record from a row slice inherited through Linux fork."""
+    asin, start, end = task
+    group = _MP_FEATURE_DF.iloc[start:end].reset_index(drop=True)
+    return _build_one_asin_feature_record(
+        asin, group, _MP_FEATURE_CONTEXT_COLS, _MP_FEATURE_DPH_PROXY_COLS
+    )
+
 def load_real_data(data_raw, dph_cap_q=0.995):
     """
     34 history features.
@@ -815,120 +952,55 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
     df["t"] = ((df["Week"] - df["Week"].min()).dt.days // 7).astype(int)
 
+    # Per-ASIN rolling feature construction is CPU-bound and independent across ASINs.
+    # Use Linux fork so workers inherit the large sorted dataframe by copy-on-write.
+    # Global preprocessing (caps, encodings, normalization) remains single-process,
+    # so this changes execution speed only, not feature definitions or values.
     data = {}
-    for asin, group in df.groupby("ASIN"):
-        group = group.reset_index(drop=True)
-        demand = group["Demand"].values.astype(float)
-        oos    = group["OOS"].values.astype(float)
-        weeks  = group["Week"].values
-        t      = group["t"].values
-        T      = len(demand)
+    num_feature_workers = min(8, max(1, (os.cpu_count() or 1) - 1))
 
-        v_t = np.log1p(demand)
-        b_t = (demand > 0).astype(float)
+    group_sizes = df.groupby("ASIN", sort=False).size()
+    tasks = []
+    row_start = 0
+    for asin, n_rows in group_sizes.items():
+        row_end = row_start + int(n_rows)
+        tasks.append((asin, row_start, row_end))
+        row_start = row_end
 
-        d_t = np.zeros(T)
-        last = -1
-        for i in range(T):
-            if b_t[i] > 0: last = i
-            d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
+    built_in_parallel = False
+    can_fork = (os.name == "posix") and (mp.get_start_method(allow_none=True) != "spawn")
 
-        in_stock_lag = group["in_stock_dph"].values.astype(float)
-        instock_raw  = group["in_stock_dph"].values.astype(float)
-        price_log    = group["our_price"].values.astype(float)
-        price_raw    = group["our_price_raw"].values.astype(float)
-        pkg_volume_raw = group["pkg_volume_raw"].values.astype(float)
-        total_dph_raw = group["total_dph"].values.astype(float)
-        buy_box_dph_raw = group["buy_box_dph"].values.astype(float)
+    if can_fork and num_feature_workers > 1 and len(tasks) >= 2:
+        try:
+            global _MP_FEATURE_DF, _MP_FEATURE_CONTEXT_COLS, _MP_FEATURE_DPH_PROXY_COLS
+            _MP_FEATURE_DF = df
+            _MP_FEATURE_CONTEXT_COLS = context_cols
+            _MP_FEATURE_DPH_PROXY_COLS = dph_proxy_cols
 
-        # All rolling features now exclude current step (leak-free)
-        hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
-        hist_nonzero_p75_52  = _rolling_positive_quantile(demand, 52, 0.75)
-        recent_peak_13       = _rolling_max_lag(demand, 13)
+            print(f"Building per-ASIN rolling features with {min(num_feature_workers, len(tasks))} processes...")
+            ctx = mp.get_context("fork")
+            with ctx.Pool(processes=min(num_feature_workers, len(tasks))) as pool:
+                for asin, record in pool.imap(_mp_feature_worker, tasks, chunksize=32):
+                    data[asin] = record
+            built_in_parallel = True
+        except Exception as e:
+            print(
+                f"Parallel feature build failed ({type(e).__name__}: {e}); "
+                "falling back to serial construction."
+            )
+            data = {}
+        finally:
+            _MP_FEATURE_DF = None
+            _MP_FEATURE_CONTEXT_COLS = None
+            _MP_FEATURE_DPH_PROXY_COLS = None
 
-        active_rate_4   = _rolling_mean(b_t, 4)
-        active_rate_13  = _rolling_mean(b_t, 13)
-        oos_rate_4      = _rolling_mean(oos, 4)
-        oos_rate_13     = _rolling_mean(oos, 13)
-        instock_mean_4  = _rolling_mean(in_stock_lag, 4)
-        instock_mean_13 = _rolling_mean(in_stock_lag, 13)
-
-        total_dph_mean_4  = _rolling_mean(total_dph_raw, 4)
-        total_dph_mean_13 = _rolling_mean(total_dph_raw, 13)
-        buy_box_dph_mean_4  = _rolling_mean(buy_box_dph_raw, 4)
-        buy_box_dph_mean_13 = _rolling_mean(buy_box_dph_raw, 13)
-
-        buy_box_rate = buy_box_dph_raw / (total_dph_raw + 1.0)
-        in_stock_rate = instock_raw / (total_dph_raw + 1.0)
-        in_stock_given_buybox = instock_raw / (buy_box_dph_raw + 1.0)
-
-        buy_box_rate = np.clip(buy_box_rate, 0.0, 10.0)
-        in_stock_rate = np.clip(in_stock_rate, 0.0, 10.0)
-        in_stock_given_buybox = np.clip(in_stock_given_buybox, 0.0, 10.0)
-
-        zero_streak     = _zero_streak(b_t) / 52.0
-
-        positive_mean_4  = _rolling_positive_mean(demand, 4)
-        positive_mean_13 = _rolling_positive_mean(demand, 13)
-        positive_max_13  = _rolling_max_lag(demand, 13)
-        positive_std_13  = _rolling_std(np.log1p(demand), 13)
-
-        features = np.stack([
-            v_t,
-            b_t,
-            d_t,
-            np.sin(2 * np.pi * t / 52),
-            np.cos(2 * np.pi * t / 52),
-            group["promo_t"].values.astype(float),
-            np.sin(2 * np.pi * t / 13),
-            np.cos(2 * np.pi * t / 13),
-            np.log1p(hist_nonzero_mean_52),   # 8
-            np.log1p(hist_nonzero_p75_52),    # 9
-            np.log1p(recent_peak_13),         # 10
-            np.log1p(in_stock_lag),
-            oos,
-            active_rate_4,
-            active_rate_13,
-            oos_rate_4,
-            oos_rate_13,
-            np.log1p(instock_mean_4),
-            np.log1p(instock_mean_13),
-            zero_streak,
-            price_log,
-            np.log1p(positive_mean_4),
-            np.log1p(positive_mean_13),
-            np.log1p(positive_max_13),
-            positive_std_13,
-
-            np.log1p(total_dph_raw),
-            np.log1p(buy_box_dph_raw),
-            np.log1p(total_dph_mean_4),
-            np.log1p(total_dph_mean_13),
-            np.log1p(buy_box_dph_mean_4),
-            np.log1p(buy_box_dph_mean_13),
-            buy_box_rate,
-            in_stock_rate,
-            in_stock_given_buybox,
-        ], axis=1).astype(np.float32)
-
-        future_context = group[context_cols].values.astype(np.float32)
-
-
-        data[asin] = {
-            "features": features,
-            "future_context": future_context,
-            "demand": demand.astype(np.float32),
-            "week": weeks,
-            "oos": oos.astype(np.float32),
-            "price_raw": price_raw.astype(np.float32),
-            "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
-            "instock_raw": instock_raw.astype(np.float32),
-            "total_dph_raw": total_dph_raw.astype(np.float32),
-            "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
-            "dph_proxy_context_idx": {
-                c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
-            },
-        }
+    if not built_in_parallel:
+        print("Building per-ASIN rolling features serially...")
+        for asin, group in df.groupby("ASIN", sort=False):
+            asin_key, record = _build_one_asin_feature_record(
+                asin, group.reset_index(drop=True), context_cols, dph_proxy_cols
+            )
+            data[asin_key] = record
 
     print("History encoder dim: 34")
     print(f"Package dimension columns for total_size: {pkg_cols}")
