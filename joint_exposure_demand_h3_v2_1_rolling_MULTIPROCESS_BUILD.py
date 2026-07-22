@@ -2254,17 +2254,135 @@ def magnitude_gap(diag_df):
 # =====================================================
 
 def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
+    """Same extreme-ASIN filtering logic, with line-level timing logs."""
+    _all_t0 = time.time()
+    print(
+        f"[EXTREME-DBG 01] ENTER | rows={len(data_high):,} | "
+        f"asins={data_high[asin_col].nunique():,} | q={q}",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 02] data_high.copy() START", flush=True)
     df = data_high.copy()
-    df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce").fillna(0).clip(lower=0)
-    pos = df.loc[df[demand_col]>0, demand_col]
-    if len(pos) == 0: return df, pd.DataFrame(), np.nan
+    print(
+        f"[EXTREME-DBG 03] data_high.copy() DONE | elapsed={time.time()-_t0:.2f}s | "
+        f"memory_gb={df.memory_usage(deep=True).sum()/1024**3:.2f}",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print(f"[EXTREME-DBG 04] pd.to_numeric({demand_col}) START", flush=True)
+    demand_numeric = pd.to_numeric(df[demand_col], errors="coerce")
+    print(
+        f"[EXTREME-DBG 05] pd.to_numeric DONE | elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 06] fillna(0).clip(lower=0) START", flush=True)
+    demand_numeric = demand_numeric.fillna(0).clip(lower=0)
+    print(
+        f"[EXTREME-DBG 07] fillna/clip DONE | elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 08] assign cleaned demand column START", flush=True)
+    df[demand_col] = demand_numeric
+    print(
+        f"[EXTREME-DBG 09] assign cleaned demand column DONE | elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 10] positive-demand mask/filter START", flush=True)
+    pos = df.loc[df[demand_col] > 0, demand_col]
+    print(
+        f"[EXTREME-DBG 11] positive-demand filter DONE | positives={len(pos):,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    if len(pos) == 0:
+        print(
+            f"[EXTREME-DBG 12] NO POSITIVE DEMAND | total_elapsed={time.time()-_all_t0:.2f}s",
+            flush=True,
+        )
+        return df, pd.DataFrame(), np.nan
+
+    _t0 = time.time()
+    print(f"[EXTREME-DBG 13] quantile({q}) START", flush=True)
     cap = float(pos.quantile(q))
-    asin_peak = df.groupby(asin_col)[demand_col].max().reset_index(name="asin_max")
-    bad_asins = asin_peak.loc[asin_peak["asin_max"]>cap, asin_col]
-    clean = df[~df[asin_col].isin(bad_asins)].copy()
-    print(f"\nExtreme ASIN filter (p{int(q*100)}={cap:.1f}): removed {bad_asins.nunique()} ASINs")
-    print(f"Clean ASINs: {clean[asin_col].nunique()} | Clean rows: {len(clean)}")
-    return clean, asin_peak[asin_peak[asin_col].isin(bad_asins)], cap
+    print(
+        f"[EXTREME-DBG 14] quantile DONE | cap={cap:.6f} | elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 15] groupby(asin).max START", flush=True)
+    asin_peak = (
+        df.groupby(asin_col, sort=False, observed=True)[demand_col]
+        .max()
+        .reset_index(name="asin_max")
+    )
+    print(
+        f"[EXTREME-DBG 16] groupby(asin).max DONE | groups={len(asin_peak):,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 17] identify bad ASINs START", flush=True)
+    bad_mask = asin_peak["asin_max"] > cap
+    bad_asins = asin_peak.loc[bad_mask, asin_col]
+    print(
+        f"[EXTREME-DBG 18] identify bad ASINs DONE | bad_asins={bad_asins.nunique():,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 19] df[asin].isin(bad_asins) START", flush=True)
+    row_bad_mask = df[asin_col].isin(bad_asins)
+    print(
+        f"[EXTREME-DBG 20] isin DONE | bad_rows={int(row_bad_mask.sum()):,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 21] create clean dataframe START", flush=True)
+    clean = df.loc[~row_bad_mask].copy()
+    print(
+        f"[EXTREME-DBG 22] create clean dataframe DONE | rows={len(clean):,} | "
+        f"asins={clean[asin_col].nunique():,} | elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-DBG 23] create removed dataframe START", flush=True)
+    removed = asin_peak.loc[bad_mask].copy()
+    print(
+        f"[EXTREME-DBG 24] create removed dataframe DONE | rows={len(removed):,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    print(
+        f"\nExtreme ASIN filter (p{int(q*100)}={cap:.1f}): "
+        f"removed {bad_asins.nunique()} ASINs",
+        flush=True,
+    )
+    print(
+        f"Clean ASINs: {clean[asin_col].nunique()} | Clean rows: {len(clean)}",
+        flush=True,
+    )
+    print(
+        f"[EXTREME-DBG 25] RETURN | total_elapsed={time.time()-_all_t0:.2f}s",
+        flush=True,
+    )
+    return clean, removed, cap
 
 
 def run_nb_high_sparse(
