@@ -4494,14 +4494,32 @@ def _graph_safe_num(x, fill=0.0):
 
 
 def _graph_build_meta_from_raw(data_raw):
-    """Static product metadata used for graph neighbor construction."""
-    df = data_raw.copy()
-    asin_col = "asin" if "asin" in df.columns else ("ASIN" if "ASIN" in df.columns else None)
+    """Static product metadata used for graph neighbor construction.
+
+    Safe optimization: operate only on columns required by the graph instead
+    of copying the full rolling dataframe. The grouping, sorting, mode, and
+    last-observation rules are unchanged, so graph metadata is identical.
+    """
+    t0 = time.perf_counter()
+    print(f"[GRAPH-META] START | rows={len(data_raw):,}", flush=True)
+
+    asin_col = "asin" if "asin" in data_raw.columns else ("ASIN" if "ASIN" in data_raw.columns else None)
     if asin_col is None:
+        print("[GRAPH-META] no ASIN column; returning empty metadata", flush=True)
         return {}
+
+    required = [
+        asin_col, "order_week", "pkg_height", "pkg_length", "pkg_width",
+        "pkg_weight", "our_price", "ind_top10_brand", "category_code", "hbt",
+    ]
+    present = [c for c in required if c in data_raw.columns]
+    # This is the main memory optimization: copy only graph-relevant columns.
+    df = data_raw.loc[:, present].copy()
+
     df[asin_col] = df[asin_col].astype(str)
     if "order_week" in df.columns:
         df["order_week"] = pd.to_datetime(df["order_week"], errors="coerce")
+        # Keep the same pandas sorting behavior as the original implementation.
         df = df.sort_values([asin_col, "order_week"])
 
     for c in ["pkg_height", "pkg_length", "pkg_width", "pkg_weight", "our_price", "ind_top10_brand"]:
@@ -4515,8 +4533,9 @@ def _graph_build_meta_from_raw(data_raw):
         df["hbt"] = "MISSING"
 
     meta = {}
-    for asin, g in df.groupby(asin_col):
-        last = g.iloc[-1]
+    groups = df.groupby(asin_col, sort=True)
+    n_groups = groups.ngroups
+    for i, (asin, g) in enumerate(groups, 1):
         dims = {}
         for c in ["pkg_height", "pkg_length", "pkg_width", "pkg_weight"]:
             vals = pd.to_numeric(g[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
@@ -4535,6 +4554,11 @@ def _graph_build_meta_from_raw(data_raw):
             "log_our_price": float(np.log1p(max(price, 0.0))),
             **dims,
         }
+        if i % 5000 == 0 or i == n_groups:
+            elapsed = time.perf_counter() - t0
+            print(f"[GRAPH-META] progress {i:,}/{n_groups:,} | {elapsed/60:.2f} min", flush=True)
+
+    print(f"[GRAPH-META] DONE | ASINs={len(meta):,} | {(time.perf_counter()-t0)/60:.2f} min", flush=True)
     return meta
 
 
@@ -4580,28 +4604,88 @@ def _graph_percentile_rank(value, values):
 
 
 def _graph_add_context_cols_to_data(data, context_cols, data_raw=None):
-    """Append zero graph columns to every future_context and attach product metadata."""
-    context_cols = list(context_cols)
-    add_cols = [c for c in GRAPH_CONTEXT_COLS if c not in context_cols]
-    if len(add_cols) > 0:
-        for d in data.values():
-            zeros = np.zeros((d["future_context"].shape[0], len(add_cols)), dtype=np.float32)
-            d["future_context"] = np.concatenate([d["future_context"], zeros], axis=1)
-        context_cols = context_cols + add_cols
+    """Build the final future-context layout in one allocation and attach metadata.
 
+    This combines the previous append-zero-columns and later column-reorder passes.
+    Values, graph columns, and final column order are unchanged; only redundant
+    NumPy allocations/copies are removed.
+    """
+    t0 = time.perf_counter()
+    old_cols = list(context_cols)
+    add_cols = [c for c in GRAPH_CONTEXT_COLS if c not in old_cols]
+    appended_cols = old_cols + add_cols
+
+    if all(c in appended_cols for c in EXTERNAL_HAT_COLS):
+        non_hat_cols = [c for c in appended_cols if c not in EXTERNAL_HAT_COLS]
+        final_cols = non_hat_cols + EXTERNAL_HAT_COLS
+    else:
+        final_cols = appended_cols
+
+    old_pos = {c: i for i, c in enumerate(old_cols)}
+    final_pos = {c: i for i, c in enumerate(final_cols)}
+    n_asins = len(data)
+    print(
+        f"[GRAPH-CONTEXT] layout START | ASINs={n_asins:,} | "
+        f"old_dim={len(old_cols)} | new_dim={len(final_cols)} | added={len(add_cols)}",
+        flush=True,
+    )
+
+    for i, d in enumerate(data.values(), 1):
+        old_fc = np.asarray(d["future_context"], dtype=np.float32)
+        # Allocate the exact final shape once. New graph columns remain zero.
+        new_fc = np.zeros((old_fc.shape[0], len(final_cols)), dtype=np.float32)
+        for col, src_idx in old_pos.items():
+            dst_idx = final_pos.get(col)
+            if dst_idx is not None:
+                new_fc[:, dst_idx] = old_fc[:, src_idx]
+        d["future_context"] = new_fc
+
+        if i % 5000 == 0 or i == n_asins:
+            print(
+                f"[GRAPH-CONTEXT] array progress {i:,}/{n_asins:,} | "
+                f"{(time.perf_counter()-t0)/60:.2f} min",
+                flush=True,
+            )
+
+    print(f"[GRAPH-CONTEXT] metadata build CALL", flush=True)
     meta = _graph_build_meta_from_raw(data_raw) if data_raw is not None else {}
-    for asin, d in data.items():
-        d["context_cols"] = context_cols
-        d["graph_context_idx"] = {c: context_cols.index(c) for c in GRAPH_CONTEXT_COLS if c in context_cols}
-        d["graph_meta"] = meta.get(str(asin), {
-            "category_code": "UNKNOWN", "hbt": "missing", "ind_top10_brand": 0.0,
-            "log_our_price": 0.0, "log_pkg_height": np.nan, "log_pkg_length": np.nan,
-            "log_pkg_width": np.nan, "log_pkg_weight": np.nan, "log_pkg_volume": np.nan,
-        })
-    return data, len(context_cols), context_cols
+    default_meta = {
+        "category_code": "UNKNOWN", "hbt": "missing", "ind_top10_brand": 0.0,
+        "log_our_price": 0.0, "log_pkg_height": np.nan, "log_pkg_length": np.nan,
+        "log_pkg_width": np.nan, "log_pkg_weight": np.nan, "log_pkg_volume": np.nan,
+    }
+    graph_idx = {c: final_pos[c] for c in GRAPH_CONTEXT_COLS if c in final_pos}
+
+    print(f"[GRAPH-CONTEXT] attach metadata START", flush=True)
+    for i, (asin, d) in enumerate(data.items(), 1):
+        d["context_cols"] = final_cols
+        d["graph_context_idx"] = graph_idx.copy()
+        d["graph_meta"] = meta.get(str(asin), default_meta.copy())
+        d["dph_proxy_context_idx"] = {
+            c: final_pos[c]
+            for c in d.get("dph_proxy_context_idx", {})
+            if c in final_pos
+        }
+        if i % 10000 == 0 or i == n_asins:
+            print(f"[GRAPH-CONTEXT] attach progress {i:,}/{n_asins:,}", flush=True)
+
+    print(f"[GRAPH-CONTEXT] DONE | {(time.perf_counter()-t0)/60:.2f} min", flush=True)
+    return data, len(final_cols), final_cols
+
+
+_GRAPH_NEIGHBOR_MAP_CACHE = {}
 
 
 def _graph_build_neighbor_map(data, min_neighbors=3):
+    """Build the exact original neighbor map, with reuse for train/validation datasets."""
+    cache_key = (id(data), len(data), int(min_neighbors))
+    cached = _GRAPH_NEIGHBOR_MAP_CACHE.get(cache_key)
+    if cached is not None:
+        print("[GRAPH-NEIGHBORS] cache HIT", flush=True)
+        return cached
+
+    t0 = time.perf_counter()
+    print(f"[GRAPH-NEIGHBORS] START | ASINs={len(data):,}", flush=True)
     asins = list(data.keys())
     by_cat = {}
     for a in asins:
@@ -4609,18 +4693,28 @@ def _graph_build_neighbor_map(data, min_neighbors=3):
         by_cat.setdefault(cat, []).append(a)
 
     nbrs = {}
-    for a in asins:
+    for i, a in enumerate(asins, 1):
         mi = data[a].get("graph_meta", {})
+        same_cat = by_cat.get(mi.get("category_code", "UNKNOWN"), [])
         cand = []
-        for b in by_cat.get(mi.get("category_code", "UNKNOWN"), []):
+        for b in same_cat:
             if b == a:
                 continue
             mj = data[b].get("graph_meta", {})
             if _graph_pkg_relaxed_similar(mi, mj):
                 cand.append(b)
         if len(cand) < min_neighbors:
-            cand = [b for b in by_cat.get(mi.get("category_code", "UNKNOWN"), []) if b != a]
+            cand = [b for b in same_cat if b != a]
         nbrs[a] = cand
+        if i % 5000 == 0 or i == len(asins):
+            print(
+                f"[GRAPH-NEIGHBORS] progress {i:,}/{len(asins):,} | "
+                f"{(time.perf_counter()-t0)/60:.2f} min",
+                flush=True,
+            )
+
+    _GRAPH_NEIGHBOR_MAP_CACHE[cache_key] = nbrs
+    print(f"[GRAPH-NEIGHBORS] DONE | {(time.perf_counter()-t0)/60:.2f} min", flush=True)
     return nbrs
 
 
@@ -4774,24 +4868,18 @@ EXTERNAL_HAT_COLS = [
 
 
 def _reorder_future_context_keep_hats_last(data, context_cols):
+    """Compatibility no-op: final ordering is already produced in one pass above."""
     context_cols = list(context_cols)
-    if not all(c in context_cols for c in EXTERNAL_HAT_COLS):
-        return data, len(context_cols), context_cols
-    non_hat_cols = [c for c in context_cols if c not in EXTERNAL_HAT_COLS]
-    new_cols = non_hat_cols + EXTERNAL_HAT_COLS
-    old_idx = [context_cols.index(c) for c in new_cols]
-    for d in data.values():
-        d["future_context"] = d["future_context"][:, old_idx]
-        d["dph_proxy_context_idx"] = {c: new_cols.index(c) for c in d.get("dph_proxy_context_idx", {}) if c in new_cols}
-        d["graph_context_idx"] = {c: new_cols.index(c) for c in GRAPH_CONTEXT_COLS if c in new_cols}
-    return data, len(new_cols), new_cols
+    return data, len(context_cols), context_cols
 
 
 def load_real_data(data_raw, dph_cap_q=0.995):
     _wrapper_t0 = time.perf_counter()
     print("[STAGE] graph-context wrapper START", flush=True)
     data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT(data_raw, dph_cap_q=dph_cap_q)
+    print("[STAGE] base load_real_data RETURNED; graph preprocessing START", flush=True)
     data, context_dim, context_cols = _graph_add_context_cols_to_data(data, context_cols, data_raw=data_raw)
+    print("[STAGE] graph preprocessing RETURNED", flush=True)
     data, context_dim, context_cols = _reorder_future_context_keep_hats_last(data, context_cols)
     print("\n" + "=" * 100)
     print("PACKAGE-AWARE RELATION GRAPH FEATURES ADDED TO DEMAND FUTURE_CONTEXT")
