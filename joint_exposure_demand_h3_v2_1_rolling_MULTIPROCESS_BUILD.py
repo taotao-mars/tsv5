@@ -2426,8 +2426,8 @@ def run_nb_high_sparse(
     all_demand = np.concatenate([d["demand"] for d in data.values()])
     print(f"ASINs: {len(data)} | Zero rate: {(all_demand==0).mean():.1%}")
 
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val",   horizon)
+    tr_ds = DemandDataset(data, history, horizon, "train", horizon, num_build_workers=4)
+    va_ds = DemandDataset(data, history, horizon, "val",   horizon, num_build_workers=4)
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
     print(f"Train: {len(tr_ds)} | Val: {len(va_ds)}")
@@ -3460,8 +3460,8 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     print(f"ASINs used for training: {len(data)}")
     print(f"Zero rate: {(all_demand == 0).mean():.1%}")
 
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val", horizon)
+    tr_ds = DemandDataset(data, history, horizon, "train", horizon, num_build_workers=4)
+    va_ds = DemandDataset(data, history, horizon, "val", horizon, num_build_workers=4)
 
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
@@ -3662,8 +3662,8 @@ def run_nb_all_sample_scot_intersection(
     print(f"ASINs used for training: {len(data)}")
     print(f"Overall zero rate: {(all_demand == 0).mean():.1%}")
 
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val", horizon)
+    tr_ds = DemandDataset(data, history, horizon, "train", horizon, num_build_workers=4)
+    va_ds = DemandDataset(data, history, horizon, "val", horizon, num_build_workers=4)
 
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
@@ -4827,7 +4827,15 @@ class DemandDataset(_GraphContextMixin, _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CO
                 asin_starts.append((asin, starts, history, horizon))
 
         if num_build_workers is None:
-            num_build_workers = max(1, (os.cpu_count() or 1) - 1)
+            num_build_workers = 4
+        num_build_workers = max(1, int(num_build_workers))
+        dataset_chunksize = 64
+
+        print(
+            f"[DATASET] plan | mode={mode} | eligible_asins={len(asin_starts):,} | "
+            f"workers={num_build_workers} | chunksize={dataset_chunksize}",
+            flush=True,
+        )
 
         built_in_parallel = False
         if num_build_workers > 1 and len(asin_starts) >= 2 and mp.get_start_method(allow_none=True) != "spawn":
@@ -4835,10 +4843,38 @@ class DemandDataset(_GraphContextMixin, _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CO
                 global _MP_BUILD_DATASET
                 _MP_BUILD_DATASET = self  # inherited via fork copy-on-write, not pickled per task
                 ctx = mp.get_context("fork")
-                with ctx.Pool(processes=min(num_build_workers, len(asin_starts))) as pool:
-                    for raw_chunk in pool.imap(_mp_build_dataset_worker, asin_starts, chunksize=4):
+                actual_workers = min(num_build_workers, len(asin_starts))
+                print(
+                    f"[DATASET] pool START | mode={mode} | workers={actual_workers} | "
+                    f"chunksize={dataset_chunksize}",
+                    flush=True,
+                )
+                completed_asins = 0
+                pool_t0 = time.perf_counter()
+                with ctx.Pool(processes=actual_workers) as pool:
+                    for raw_chunk in pool.imap(
+                        _mp_build_dataset_worker, asin_starts, chunksize=dataset_chunksize
+                    ):
                         for raw in raw_chunk:
                             self.samples.append(_mp_row_to_tensors(raw))
+                        completed_asins += 1
+                        if completed_asins % 1000 == 0 or completed_asins == len(asin_starts):
+                            elapsed = time.perf_counter() - pool_t0
+                            rate = completed_asins / elapsed if elapsed > 0 else 0.0
+                            remaining = len(asin_starts) - completed_asins
+                            eta_min = (remaining / rate / 60.0) if rate > 0 else float("inf")
+                            print(
+                                f"[DATASET] progress | mode={mode} | "
+                                f"{completed_asins:,}/{len(asin_starts):,} ASINs | "
+                                f"samples={len(self.samples):,} | "
+                                f"elapsed={elapsed/60:.2f} min | ETA={eta_min:.2f} min",
+                                flush=True,
+                            )
+                print(
+                    f"[DATASET] pool DONE | mode={mode} | "
+                    f"elapsed={(time.perf_counter()-pool_t0)/60:.2f} min",
+                    flush=True,
+                )
                 built_in_parallel = True
             except Exception as e:
                 print(f"Parallel DemandDataset build failed ({type(e).__name__}: {e}); "
@@ -5499,8 +5535,8 @@ def run_joint_exposure_demand_h3_end2end(
             "last instead. Check the placeholder column names set above "
             "match the _log-suffixed names load_real_data requires."
         )
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val", horizon)
+    tr_ds = DemandDataset(data, history, horizon, "train", horizon, num_build_workers=4)
+    va_ds = DemandDataset(data, history, horizon, "val", horizon, num_build_workers=4)
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, pin_memory=(DEVICE.type == "cuda"))
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, pin_memory=(DEVICE.type == "cuda"))
     if len(tr_ds) == 0 or len(va_ds) == 0:
