@@ -472,59 +472,12 @@ def _select_stock_decoder_extra_cols(data_raw):
 
     We keep a conservative list to avoid leakage-prone realized future outcomes.
     """
+    # Top-3 ablation choice for the external exposure / in-stock decoder.
+    # These are the only additional stock_extra__ features added to future_context.
     candidate_cols = [
-        # Product/category/static identity proxies
-        "gl_product_group",
-        "category_code",
-        "brand_class",
-        "sort_type",
-        "variation",
-        "ind_new_asin",
-        "ind_amxl_hb",
-        "hbt",
-        "ind_target_audience",
-        "ind_top10_brand",
-        "ind_top10_review_brand",
-
-        # Review / popularity proxies.
-        # NOTE: total_dph and buy_box_dph are intentionally excluded here
-        # because future realized traffic / buy-box signals may cause leakage.
-        "cust_avg_active_review_rating",
-        "customer_active_review_count",
-        "customer_average_review_rating",
-        "customer_review_count",
-        "glance_view_band_cat",
-        "hb_rank",
-        "hb_score",
-        "facebook_fan_count",
-        "instagram_fan_count",
-        "twitter_follower_count",
-        "youtube_subscriber_count",
-
-        # Price / promotion
-        "list_price",
-        "price_bands",
         "ind_promotion",
-        "promotion_amount",
-        "promotion_ratio",
         "promotion_pricing_amount",
-        "promotion_type",
         "pricing_type",
-        "asin_promo_start_week",
-        "asin_promo_end_week",
-        "asin_promo_wordcount",
-
-        # Package / AMXL size
-        "pkg_height",
-        "pkg_length",
-        "pkg_width",
-        "pkg_weight",
-
-        # Calendar-ish columns
-        "order_month",
-        "order_year",
-        "week_index",
-        "ind_prime_week",
     ]
 
     # Avoid realized target / future outcome columns.
@@ -1915,7 +1868,7 @@ def train(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     lambda_stock=0.0,
@@ -2180,7 +2133,7 @@ def run_nb_high_sparse(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     lambda_stock=0.05,
@@ -2341,7 +2294,7 @@ def run_nb_high_sparse_with_wape(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     lambda_stock=0.05,
@@ -3188,7 +3141,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     lambda_stock=0.05,
@@ -3372,7 +3325,7 @@ def run_nb_all_sample_scot_intersection(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     lambda_stock=0.05,
@@ -3888,7 +3841,7 @@ def run_external_exposure3_in_old_decoder_style(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     lambda_stock=0.0,
@@ -4711,7 +4664,7 @@ def run_demand_current_best_instock_only(
     batch_size=64,
     M_eval=100,
     lambda_q=0.08,
-    lambda_under=0.15,
+    lambda_under=0.0,
     q_active_weight=2.0,
     q_tail_weight=0.30,
     beta_tail=0.5,
@@ -4999,7 +4952,7 @@ def joint_exposure_loss(exposure_hat, active_logits, true_exposure):
 
 def train_joint_exposure_demand_h3(
     model, tr_ld, va_ld, epochs=60, lr=1e-3, nZ=8,
-    beta_tail=0.5, lambda_under=0.15, lambda_over=0.0, lambda_z_reg=1.0,
+    beta_tail=0.5, lambda_under=0.0, lambda_over=0.0, lambda_z_reg=1.0,
     lambda_exposure=0.50, patience=6,
 ):
     model = model.to(DEVICE)
@@ -5024,15 +4977,22 @@ def train_joint_exposure_demand_h3(
                 tail_weighted_negbin_nll(b["y"], mu, alpha, beta_tail=beta_tail)
                 for mu, alpha in out["demand_preds"]
             ) / nZ
-            mu_mean = torch.stack([m for m, _ in out["demand_preds"]], dim=1).mean(dim=1)
-            under = active_underforecast_loss(b["y"], mu_mean, log_scale=True)
-            over = active_overforecast_loss(b["y"], mu_mean, log_scale=True)
-            demand_loss = (
-                demand_nll
-                + lambda_under * under
-                + lambda_over * over
-                + lambda_z_reg * out["z_reg"]
-            )
+            demand_loss = demand_nll + lambda_z_reg * out["z_reg"]
+
+            # Optional asymmetric bias losses. Defaults are both zero, so the
+            # model is trained without an explicit under/over-forecast preference.
+            if lambda_under > 0.0 or lambda_over > 0.0:
+                mu_mean = torch.stack(
+                    [m for m, _ in out["demand_preds"]], dim=1
+                ).mean(dim=1)
+                if lambda_under > 0.0:
+                    demand_loss = demand_loss + lambda_under * active_underforecast_loss(
+                        b["y"], mu_mean, log_scale=True
+                    )
+                if lambda_over > 0.0:
+                    demand_loss = demand_loss + lambda_over * active_overforecast_loss(
+                        b["y"], mu_mean, log_scale=True
+                    )
 
             exp_loss = joint_exposure_loss(
                 out["exposure_hat"], out["exposure_active_logits"], true_exp
@@ -5168,7 +5128,7 @@ def run_joint_exposure_demand_h3_end2end(
     M_eval=100,
     beta_tail=0.5,
     patience=6,
-    lambda_under=0.15,
+    lambda_under=0.0,
     lambda_over=0.0,
     lambda_exposure=0.50,
     detach_exposure_for_demand=False,
@@ -5838,7 +5798,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     M_eval=100,
     beta_tail=0.5,
     patience=6,
-    lambda_under=0.15,
+    lambda_under=0.0,
     lambda_over=0.0,
     lambda_exposure=0.50,
     detach_exposure_for_demand=False,
