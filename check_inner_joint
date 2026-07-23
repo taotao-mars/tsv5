@@ -1,0 +1,268 @@
+import io
+import re
+import boto3
+import pandas as pd
+
+
+# ============================================================
+# 1. S3 配置：与你原代码一致
+# ============================================================
+
+S3_BUCKET = "amxl-asin-forecast590184089576"
+
+DATA_PREFIX = (
+    "amxl-asin-forecast-intern/data_for_model/"
+    "df_head_body_add_holiday_"
+)
+
+SCOT_PREFIX = "amxl-asin-forecast-intern/scotforecast/"
+
+s3 = boto3.client("s3")
+
+
+# ============================================================
+# 2. 列出 S3 prefix 下所有文件
+# ============================================================
+
+def list_s3_keys(bucket, prefix):
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+
+    for page in paginator.paginate(
+        Bucket=bucket,
+        Prefix=prefix,
+    ):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key")
+            if key:
+                keys.append(key)
+
+    return keys
+
+
+# ============================================================
+# 3. 找到 feature cut 和对应的 SCOT 文件
+#
+# feature cut: D（通常为 Saturday）
+# SCOT FCD:   D + 1 day（Sunday）
+# ============================================================
+
+def find_complete_pairs():
+    print("[S3] listing feature snapshots...", flush=True)
+    data_keys = list_s3_keys(S3_BUCKET, DATA_PREFIX)
+
+    print("[S3] listing SCOT files...", flush=True)
+    scot_keys = list_s3_keys(S3_BUCKET, SCOT_PREFIX)
+
+    data_pattern = re.compile(
+        r"df_head_body_add_holiday_"
+        r"(\d{4}-\d{2}-\d{2})_?ETLM_[vV]3\.csv$"
+    )
+
+    scot_pattern = re.compile(
+        r"from(\d{4}-\d{2}-\d{2})_20weeks__"
+        r"headbody_scot_fcst_(?:no_refresh|refresh)\.parquet$"
+    )
+
+    data_by_date = {}
+
+    for key in data_keys:
+        match = data_pattern.search(key)
+
+        if match:
+            cut_date = pd.Timestamp(match.group(1)).normalize()
+            data_by_date[cut_date] = key
+
+    scot_by_date = {}
+
+    for key in scot_keys:
+        match = scot_pattern.search(key)
+
+        if not match:
+            continue
+
+        scot_fcd = pd.Timestamp(match.group(1)).normalize()
+
+        # 如果同一天同时有 refresh 和 no_refresh，优先 no_refresh
+        previous = scot_by_date.get(scot_fcd)
+
+        if previous is None or (
+            "no_refresh" in key
+            and "no_refresh" not in previous
+        ):
+            scot_by_date[scot_fcd] = key
+
+    pairs = []
+
+    for data_cut, data_key in sorted(data_by_date.items()):
+        scot_fcd = data_cut + pd.Timedelta(days=1)
+        scot_key = scot_by_date.get(scot_fcd)
+
+        if scot_key is not None:
+            pairs.append({
+                "data_cut": data_cut,
+                "scot_fcd": scot_fcd,
+                "data_key": data_key,
+                "scot_key": scot_key,
+            })
+
+    pairs = pd.DataFrame(pairs)
+
+    print(f"[S3] feature snapshots found: {len(data_by_date):,}")
+    print(f"[S3] SCOT files found:       {len(scot_by_date):,}")
+    print(f"[S3] complete pairs found:   {len(pairs):,}")
+
+    return pairs
+
+
+# ============================================================
+# 4. 从 S3 读取文件
+# ============================================================
+
+def read_s3_csv(bucket, key, usecols=None):
+    print(f"\n[S3] downloading CSV:\n{key}", flush=True)
+
+    body = s3.get_object(
+        Bucket=bucket,
+        Key=key,
+    )["Body"].read()
+
+    print(f"[S3] downloaded CSV bytes: {len(body):,}", flush=True)
+
+    return pd.read_csv(
+        io.BytesIO(body),
+        usecols=usecols,
+    )
+
+
+def read_s3_parquet(bucket, key, columns=None):
+    print(f"\n[S3] downloading parquet:\n{key}", flush=True)
+
+    body = s3.get_object(
+        Bucket=bucket,
+        Key=key,
+    )["Body"].read()
+
+    print(f"[S3] downloaded parquet bytes: {len(body):,}", flush=True)
+
+    return pd.read_parquet(
+        io.BytesIO(body),
+        columns=columns,
+    )
+
+
+# ============================================================
+# 5. 选择一个 cut 并测试 ASIN inner join
+# ============================================================
+
+pairs = find_complete_pairs()
+
+if len(pairs) == 0:
+    raise RuntimeError("没有找到 feature snapshot 和 SCOT 的完整配对。")
+
+
+# ------------------------------------------------------------
+# 默认测试最新的一个 cut
+# ------------------------------------------------------------
+
+selected = pairs.sort_values("data_cut").iloc[-1]
+
+print("\n" + "=" * 80)
+print("SELECTED CUT")
+print("=" * 80)
+print("Data cut:", selected["data_cut"].date())
+print("SCOT FCD:", selected["scot_fcd"].date())
+print("Data key:", selected["data_key"])
+print("SCOT key:", selected["scot_key"])
+
+
+# 这里只需要 asin，因此不用读取全部列，能明显减少内存
+data_asin_df = read_s3_csv(
+    S3_BUCKET,
+    selected["data_key"],
+    usecols=["asin"],
+)
+
+scot_asin_df = read_s3_parquet(
+    S3_BUCKET,
+    selected["scot_key"],
+    columns=["asin"],
+)
+
+
+# ============================================================
+# 6. 清洗 ASIN
+# ============================================================
+
+data_asin_df["asin"] = (
+    data_asin_df["asin"]
+    .astype("string")
+    .str.strip()
+)
+
+scot_asin_df["asin"] = (
+    scot_asin_df["asin"]
+    .astype("string")
+    .str.strip()
+)
+
+data_asin_df = data_asin_df.dropna(subset=["asin"])
+scot_asin_df = scot_asin_df.dropna(subset=["asin"])
+
+
+# ============================================================
+# 7. ASIN inner join 统计
+# ============================================================
+
+data_asins = set(data_asin_df["asin"].unique())
+scot_asins = set(scot_asin_df["asin"].unique())
+
+inner_asins = data_asins & scot_asins
+
+data_only_asins = data_asins - scot_asins
+scot_only_asins = scot_asins - data_asins
+
+
+print("\n" + "=" * 80)
+print("ASIN INNER JOIN RESULT")
+print("=" * 80)
+
+print(f"Feature rows:              {len(data_asin_df):,}")
+print(f"Feature unique ASINs:      {len(data_asins):,}")
+print(f"SCOT rows:                 {len(scot_asin_df):,}")
+print(f"SCOT unique ASINs:         {len(scot_asins):,}")
+print("-" * 80)
+print(f"ASIN inner join count:     {len(inner_asins):,}")
+print(f"Feature-only ASINs:        {len(data_only_asins):,}")
+print(f"SCOT-only ASINs:           {len(scot_only_asins):,}")
+
+data_coverage = (
+    len(inner_asins) / len(data_asins)
+    if data_asins else 0.0
+)
+
+scot_coverage = (
+    len(inner_asins) / len(scot_asins)
+    if scot_asins else 0.0
+)
+
+print(f"SCOT coverage of feature:  {data_coverage:.2%}")
+print(f"Feature coverage of SCOT:  {scot_coverage:.2%}")
+
+
+# ============================================================
+# 8. 可选：保存交集 ASIN
+# ============================================================
+
+inner_asin_df = pd.DataFrame({
+    "asin": sorted(inner_asins)
+})
+
+print("\nInner ASIN preview:")
+print(inner_asin_df.head(10))
+
+# 可选保存
+# inner_asin_df.to_csv(
+#     f"inner_asins_{selected['data_cut'].date()}.csv",
+#     index=False,
+# )
