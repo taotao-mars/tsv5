@@ -1,7 +1,7 @@
 print("[VERSION] v2_2_9 GRAPH_LAZY_GPU_LOGS", flush=True)
 
 print("\n" + "#" * 96, flush=True)
-print("[VERSION] v2_2_11 MEMORY_SAFE_FILTER_LAZY_WORKERS ACTIVE", flush=True)
+print("[VERSION] v2_2_12 GRAPH_DEEP_PROFILE_MEMORY_SAFE_LAZY_WORKERS ACTIVE", flush=True)
 print("[VERSION] Expected path: base load -> graph wrapper -> lazy dataset -> DataLoader workers", flush=True)
 print("#" * 96 + "\n", flush=True)
 # =====================================================
@@ -4507,19 +4507,41 @@ def _graph_build_meta_from_raw(data_raw):
         "pkg_weight", "our_price", "ind_top10_brand", "category_code", "hbt",
     ]
     present = [c for c in required if c in data_raw.columns]
+    print(f"[GRAPH-META 01] select/copy columns START | cols={present}", flush=True)
+    _step_t = time.perf_counter()
     # This is the main memory optimization: copy only graph-relevant columns.
     df = data_raw.loc[:, present].copy()
+    print(
+        f"[GRAPH-META 02] select/copy columns DONE | rows={len(df):,} | "
+        f"elapsed={(time.perf_counter()-_step_t)/60:.2f}m | "
+        f"memory_gb={df.memory_usage(deep=True).sum()/1024**3:.2f}",
+        flush=True,
+    )
 
+    _step_t = time.perf_counter()
+    print("[GRAPH-META 03] ASIN astype(str) START", flush=True)
     df[asin_col] = df[asin_col].astype(str)
+    print(f"[GRAPH-META 04] ASIN astype(str) DONE | elapsed={time.perf_counter()-_step_t:.2f}s", flush=True)
+
     if "order_week" in df.columns:
+        _step_t = time.perf_counter()
+        print("[GRAPH-META 05] order_week datetime conversion START", flush=True)
         df["order_week"] = pd.to_datetime(df["order_week"], errors="coerce")
+        print(f"[GRAPH-META 06] order_week datetime conversion DONE | elapsed={time.perf_counter()-_step_t:.2f}s", flush=True)
+
+        _step_t = time.perf_counter()
+        print(f"[GRAPH-META 07] sort START | keys={[asin_col, 'order_week']}", flush=True)
         # Keep the same pandas sorting behavior as the original implementation.
         df = df.sort_values([asin_col, "order_week"])
+        print(f"[GRAPH-META 08] sort DONE | elapsed={(time.perf_counter()-_step_t)/60:.2f}m", flush=True)
 
+    _step_t = time.perf_counter()
+    print("[GRAPH-META 09] numeric conversion START", flush=True)
     for c in ["pkg_height", "pkg_length", "pkg_width", "pkg_weight", "our_price", "ind_top10_brand"]:
         if c not in df.columns:
             df[c] = np.nan if c.startswith("pkg_") else 0.0
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    print(f"[GRAPH-META 10] numeric conversion DONE | elapsed={time.perf_counter()-_step_t:.2f}s", flush=True)
 
     if "category_code" not in df.columns:
         df["category_code"] = "UNKNOWN"
@@ -4527,8 +4549,13 @@ def _graph_build_meta_from_raw(data_raw):
         df["hbt"] = "MISSING"
 
     meta = {}
+    _step_t = time.perf_counter()
+    print("[GRAPH-META 11] groupby object/ngroups START", flush=True)
     groups = df.groupby(asin_col, sort=True)
     n_groups = groups.ngroups
+    print(f"[GRAPH-META 12] groupby object/ngroups DONE | groups={n_groups:,} | elapsed={time.perf_counter()-_step_t:.2f}s", flush=True)
+    print("[GRAPH-META 13] per-ASIN metadata loop START", flush=True)
+    _loop_t = time.perf_counter()
     for i, (asin, g) in enumerate(groups, 1):
         dims = {}
         for c in ["pkg_height", "pkg_length", "pkg_width", "pkg_weight"]:
@@ -4548,10 +4575,17 @@ def _graph_build_meta_from_raw(data_raw):
             "log_our_price": float(np.log1p(max(price, 0.0))),
             **dims,
         }
-        if i % 5000 == 0 or i == n_groups:
-            elapsed = time.perf_counter() - t0
-            print(f"[GRAPH-META] progress {i:,}/{n_groups:,} | {elapsed/60:.2f} min", flush=True)
+        if i % 1000 == 0 or i == n_groups:
+            elapsed = time.perf_counter() - _loop_t
+            rate = i / max(elapsed, 1e-9)
+            eta = (n_groups - i) / max(rate, 1e-9)
+            print(
+                f"[GRAPH-META 14] loop {i:,}/{n_groups:,} ({100*i/max(n_groups,1):.1f}%) | "
+                f"elapsed={elapsed/60:.2f}m | ETA={eta/60:.2f}m",
+                flush=True,
+            )
 
+    print(f"[GRAPH-META 15] per-ASIN metadata loop DONE | elapsed={(time.perf_counter()-_loop_t)/60:.2f}m", flush=True)
     print(f"[GRAPH-META] DONE | ASINs={len(meta):,} | {(time.perf_counter()-t0)/60:.2f} min", flush=True)
     return meta
 
@@ -4624,6 +4658,8 @@ def _graph_add_context_cols_to_data(data, context_cols, data_raw=None):
         flush=True,
     )
 
+    print("[GRAPH-CONTEXT 01] future_context reallocation loop START", flush=True)
+    _array_t = time.perf_counter()
     for i, d in enumerate(data.values(), 1):
         old_fc = np.asarray(d["future_context"], dtype=np.float32)
         # Allocate the exact final shape once. New graph columns remain zero.
@@ -4634,14 +4670,18 @@ def _graph_add_context_cols_to_data(data, context_cols, data_raw=None):
                 new_fc[:, dst_idx] = old_fc[:, src_idx]
         d["future_context"] = new_fc
 
-        if i % 5000 == 0 or i == n_asins:
+        if i % 1000 == 0 or i == n_asins:
+            elapsed = time.perf_counter() - _array_t
+            rate = i / max(elapsed, 1e-9)
+            eta = (n_asins-i) / max(rate, 1e-9)
             print(
-                f"[GRAPH-CONTEXT] array progress {i:,}/{n_asins:,} | "
-                f"{(time.perf_counter()-t0)/60:.2f} min",
+                f"[GRAPH-CONTEXT 02] arrays {i:,}/{n_asins:,} ({100*i/max(n_asins,1):.1f}%) | "
+                f"elapsed={elapsed/60:.2f}m | ETA={eta/60:.2f}m",
                 flush=True,
             )
 
-    print(f"[GRAPH-CONTEXT] metadata build CALL", flush=True)
+    print(f"[GRAPH-CONTEXT 03] future_context reallocation loop DONE | elapsed={(time.perf_counter()-_array_t)/60:.2f}m", flush=True)
+    print(f"[GRAPH-CONTEXT 04] metadata build CALL", flush=True)
     meta = _graph_build_meta_from_raw(data_raw) if data_raw is not None else {}
     default_meta = {
         "category_code": "UNKNOWN", "hbt": "missing", "ind_top10_brand": 0.0,
@@ -4650,7 +4690,9 @@ def _graph_add_context_cols_to_data(data, context_cols, data_raw=None):
     }
     graph_idx = {c: final_pos[c] for c in GRAPH_CONTEXT_COLS if c in final_pos}
 
-    print(f"[GRAPH-CONTEXT] attach metadata START", flush=True)
+    print(f"[GRAPH-CONTEXT 05] metadata build RETURNED | meta_asins={len(meta):,}", flush=True)
+    print(f"[GRAPH-CONTEXT 06] attach metadata START", flush=True)
+    _attach_t = time.perf_counter()
     for i, (asin, d) in enumerate(data.items(), 1):
         d["context_cols"] = final_cols
         d["graph_context_idx"] = graph_idx.copy()
@@ -4660,9 +4702,17 @@ def _graph_add_context_cols_to_data(data, context_cols, data_raw=None):
             for c in d.get("dph_proxy_context_idx", {})
             if c in final_pos
         }
-        if i % 10000 == 0 or i == n_asins:
-            print(f"[GRAPH-CONTEXT] attach progress {i:,}/{n_asins:,}", flush=True)
+        if i % 1000 == 0 or i == n_asins:
+            elapsed = time.perf_counter() - _attach_t
+            rate = i / max(elapsed, 1e-9)
+            eta = (n_asins-i) / max(rate, 1e-9)
+            print(
+                f"[GRAPH-CONTEXT 07] attach {i:,}/{n_asins:,} ({100*i/max(n_asins,1):.1f}%) | "
+                f"elapsed={elapsed/60:.2f}m | ETA={eta/60:.2f}m",
+                flush=True,
+            )
 
+    print(f"[GRAPH-CONTEXT 08] attach metadata DONE | elapsed={(time.perf_counter()-_attach_t)/60:.2f}m", flush=True)
     print(f"[GRAPH-CONTEXT] DONE | {(time.perf_counter()-t0)/60:.2f} min", flush=True)
     return data, len(final_cols), final_cols
 
