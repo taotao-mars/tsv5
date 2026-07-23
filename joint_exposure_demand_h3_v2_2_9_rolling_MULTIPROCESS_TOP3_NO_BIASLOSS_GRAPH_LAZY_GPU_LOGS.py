@@ -1,3 +1,4 @@
+print("[VERSION] v2_2_11 PROFILE_LOAD_DATA_DETAILED ACTIVE", flush=True)
 print("[VERSION] v2_2_9 GRAPH_LAZY_GPU_LOGS", flush=True)
 
 print("\n" + "#" * 96, flush=True)
@@ -749,11 +750,29 @@ def _mp_load_feature_chunk_worker(task):
     )
     chunk = _MP_LOAD_FEATURE_DF.iloc[row_start:row_end]
     out = {}
+    _asin_total_s = 0.0
+    _asin_max_s = 0.0
+    _asin_max_key = None
+    _rows_seen = 0
     for i, (asin, group) in enumerate(chunk.groupby("ASIN", sort=False), start=1):
+        _one_t0 = time.perf_counter()
         asin_key, record = _build_one_asin_feature_record(
             asin, group, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
         )
+        _one_s = time.perf_counter() - _one_t0
+        _asin_total_s += _one_s
+        _rows_seen += len(group)
+        if _one_s > _asin_max_s:
+            _asin_max_s = _one_s
+            _asin_max_key = asin
         out[asin_key] = record
+        if i <= 3:
+            print(
+                f"[LOAD-W{worker_id}-ASIN] i={i} | asin={asin} | rows={len(group):,} | "
+                f"build={_one_s:.4f}s | feature_shape={record['features'].shape} | "
+                f"context_shape={record['future_context'].shape}",
+                flush=True,
+            )
         if i == 1 or i % 1000 == 0 or i == expected_asins:
             elapsed = time.perf_counter() - t0
             rate = i / max(elapsed, 1e-9)
@@ -761,7 +780,10 @@ def _mp_load_feature_chunk_worker(task):
             print(
                 f"[LOAD-W{worker_id}] {i:,}/{expected_asins:,} "
                 f"({100*i/max(expected_asins,1):.1f}%) | "
-                f"elapsed={elapsed/60:.1f}m | ETA={eta/60:.1f}m",
+                f"elapsed={elapsed/60:.1f}m | ETA={eta/60:.1f}m | "
+                f"avg_asin={_asin_total_s/max(i,1):.4f}s | "
+                f"avg_rows={_rows_seen/max(i,1):.1f} | "
+                f"slowest={_asin_max_s:.4f}s({str(_asin_max_key)[:24]})",
                 flush=True,
             )
     print(
@@ -773,7 +795,19 @@ def _mp_load_feature_chunk_worker(task):
 
 def load_real_data(data_raw, dph_cap_q=0.995):
     _stage_t0 = time.perf_counter()
+    _load_last_t = _stage_t0
+    def _load_mark(name, **extra):
+        nonlocal _load_last_t
+        _now = time.perf_counter()
+        _suffix = " | ".join(f"{k}={v}" for k, v in extra.items())
+        print(
+            f"[LOAD-PROFILE] {name} | step={_now-_load_last_t:.2f}s | total={(_now-_stage_t0)/60:.2f}m"
+            + (f" | {_suffix}" if _suffix else ""),
+            flush=True,
+        )
+        _load_last_t = _now
     print(f"[STAGE] load_real_data START | rows={len(data_raw):,} | asins={data_raw['asin'].nunique() if 'asin' in data_raw.columns else 'NA'}", flush=True)
+    _load_mark("ENTER")
     """
     34 history features.
     Feature index map:
@@ -885,10 +919,14 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     # are used both for total_size diagnostics and stock-decoder extra features.
     keep_cols = list(dict.fromkeys(keep_cols))
 
+    print(f"[LOAD-PROFILE] dataframe subset copy START | cols={len(keep_cols)}", flush=True)
     df = data_raw[keep_cols].copy()
+    _load_mark("dataframe subset copy DONE", rows=f"{len(df):,}", cols=len(df.columns))
 
     # Encode additional product / popularity / promo / size features for stock decoder.
+    print("[LOAD-PROFILE] stock-extra encoding START", flush=True)
     df, stock_extra_cols = _encode_stock_decoder_extra_features(df, stock_extra_raw_cols)
+    _load_mark("stock-extra encoding DONE", added_cols=len(stock_extra_cols))
 
     # Add encoded stock-extra columns to future_context.
     # These features help the external exposure covariates.
@@ -910,6 +948,7 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     ]
     for c in dph_proxy_cols:
         df[c] = 0.0
+    _load_mark("DPH proxy placeholder columns DONE", proxy_cols=len(dph_proxy_cols))
 
     context_cols = context_cols + dph_proxy_cols
     df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
@@ -926,11 +965,15 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     else:
         df["pkg_volume_raw"] = np.nan
 
+    print("[LOAD-PROFILE] core dtype cleaning START", flush=True)
     df["Week"] = pd.to_datetime(df["Week"])
     df["Demand"] = pd.to_numeric(df["Demand"], errors="coerce").fillna(0).clip(lower=0)
     df["OOS"] = pd.to_numeric(df["OOS"], errors="coerce").fillna(0)
-    for c in context_cols:
+    for _ci, c in enumerate(context_cols, start=1):
         df = _safe_numeric(df, c, default=0.0)
+        if _ci == 1 or _ci % 10 == 0 or _ci == len(context_cols):
+            print(f"[LOAD-PROFILE] numeric context {_ci}/{len(context_cols)} | col={c}", flush=True)
+    _load_mark("core + context numeric cleaning DONE", context_cols=len(context_cols))
 
     # Keep raw price for amount diagnostics, then use log price for model context.
     df["our_price_raw"] = df["our_price"].clip(lower=0)
@@ -953,8 +996,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
     # Cap heavy-tailed DPH targets using total_dph as a unified exposure scale cap.
     # This cap is applied before constructing decoder targets.
+    print("[LOAD-PROFILE] DPH cap compute/apply START", flush=True)
     dph_cap = _compute_total_dph_cap(df, q=dph_cap_q)
     df = _apply_dph_cap(df, dph_cap)
+    _load_mark("DPH cap compute/apply DONE", cap=f"{dph_cap:.6f}")
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -964,7 +1009,9 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         df[c] = df[c].clip(lower=-12, upper=12) / 12.0
 
+    print("[LOAD-PROFILE] sort ASIN+Week START", flush=True)
     df = df.sort_values(["ASIN", "Week"]).reset_index(drop=True)
+    _load_mark("sort ASIN+Week DONE")
 
     if len(holiday_cols) > 0:
         holiday_window = np.zeros(len(df), dtype=np.float32)
@@ -977,6 +1024,7 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         df["promo_t"] = 0.0
 
     df["t"] = ((df["Week"] - df["Week"].min()).dt.days // 7).astype(int)
+    _load_mark("holiday/promo/t construction DONE", holiday_cols=len(holiday_cols))
 
     data = {}
     _n_asins = int(df["ASIN"].nunique())
