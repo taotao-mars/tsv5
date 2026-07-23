@@ -1,8 +1,7 @@
-print("[VERSION] v2_2_11 PROFILE_LOAD_DATA_DETAILED ACTIVE", flush=True)
 print("[VERSION] v2_2_9 GRAPH_LAZY_GPU_LOGS", flush=True)
 
 print("\n" + "#" * 96, flush=True)
-print("[VERSION] v2_2_10 PROFILE_CONTEXT62_LAZY_WORKERS ACTIVE", flush=True)
+print("[VERSION] v2_2_11 MEMORY_SAFE_FILTER_LAZY_WORKERS ACTIVE", flush=True)
 print("[VERSION] Expected path: base load -> graph wrapper -> lazy dataset -> DataLoader workers", flush=True)
 print("#" * 96 + "\n", flush=True)
 # =====================================================
@@ -750,29 +749,11 @@ def _mp_load_feature_chunk_worker(task):
     )
     chunk = _MP_LOAD_FEATURE_DF.iloc[row_start:row_end]
     out = {}
-    _asin_total_s = 0.0
-    _asin_max_s = 0.0
-    _asin_max_key = None
-    _rows_seen = 0
     for i, (asin, group) in enumerate(chunk.groupby("ASIN", sort=False), start=1):
-        _one_t0 = time.perf_counter()
         asin_key, record = _build_one_asin_feature_record(
             asin, group, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
         )
-        _one_s = time.perf_counter() - _one_t0
-        _asin_total_s += _one_s
-        _rows_seen += len(group)
-        if _one_s > _asin_max_s:
-            _asin_max_s = _one_s
-            _asin_max_key = asin
         out[asin_key] = record
-        if i <= 3:
-            print(
-                f"[LOAD-W{worker_id}-ASIN] i={i} | asin={asin} | rows={len(group):,} | "
-                f"build={_one_s:.4f}s | feature_shape={record['features'].shape} | "
-                f"context_shape={record['future_context'].shape}",
-                flush=True,
-            )
         if i == 1 or i % 1000 == 0 or i == expected_asins:
             elapsed = time.perf_counter() - t0
             rate = i / max(elapsed, 1e-9)
@@ -780,10 +761,7 @@ def _mp_load_feature_chunk_worker(task):
             print(
                 f"[LOAD-W{worker_id}] {i:,}/{expected_asins:,} "
                 f"({100*i/max(expected_asins,1):.1f}%) | "
-                f"elapsed={elapsed/60:.1f}m | ETA={eta/60:.1f}m | "
-                f"avg_asin={_asin_total_s/max(i,1):.4f}s | "
-                f"avg_rows={_rows_seen/max(i,1):.1f} | "
-                f"slowest={_asin_max_s:.4f}s({str(_asin_max_key)[:24]})",
+                f"elapsed={elapsed/60:.1f}m | ETA={eta/60:.1f}m",
                 flush=True,
             )
     print(
@@ -795,19 +773,7 @@ def _mp_load_feature_chunk_worker(task):
 
 def load_real_data(data_raw, dph_cap_q=0.995):
     _stage_t0 = time.perf_counter()
-    _load_last_t = _stage_t0
-    def _load_mark(name, **extra):
-        nonlocal _load_last_t
-        _now = time.perf_counter()
-        _suffix = " | ".join(f"{k}={v}" for k, v in extra.items())
-        print(
-            f"[LOAD-PROFILE] {name} | step={_now-_load_last_t:.2f}s | total={(_now-_stage_t0)/60:.2f}m"
-            + (f" | {_suffix}" if _suffix else ""),
-            flush=True,
-        )
-        _load_last_t = _now
     print(f"[STAGE] load_real_data START | rows={len(data_raw):,} | asins={data_raw['asin'].nunique() if 'asin' in data_raw.columns else 'NA'}", flush=True)
-    _load_mark("ENTER")
     """
     34 history features.
     Feature index map:
@@ -919,14 +885,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     # are used both for total_size diagnostics and stock-decoder extra features.
     keep_cols = list(dict.fromkeys(keep_cols))
 
-    print(f"[LOAD-PROFILE] dataframe subset copy START | cols={len(keep_cols)}", flush=True)
     df = data_raw[keep_cols].copy()
-    _load_mark("dataframe subset copy DONE", rows=f"{len(df):,}", cols=len(df.columns))
 
     # Encode additional product / popularity / promo / size features for stock decoder.
-    print("[LOAD-PROFILE] stock-extra encoding START", flush=True)
     df, stock_extra_cols = _encode_stock_decoder_extra_features(df, stock_extra_raw_cols)
-    _load_mark("stock-extra encoding DONE", added_cols=len(stock_extra_cols))
 
     # Add encoded stock-extra columns to future_context.
     # These features help the external exposure covariates.
@@ -948,7 +910,6 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     ]
     for c in dph_proxy_cols:
         df[c] = 0.0
-    _load_mark("DPH proxy placeholder columns DONE", proxy_cols=len(dph_proxy_cols))
 
     context_cols = context_cols + dph_proxy_cols
     df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
@@ -965,15 +926,11 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     else:
         df["pkg_volume_raw"] = np.nan
 
-    print("[LOAD-PROFILE] core dtype cleaning START", flush=True)
     df["Week"] = pd.to_datetime(df["Week"])
     df["Demand"] = pd.to_numeric(df["Demand"], errors="coerce").fillna(0).clip(lower=0)
     df["OOS"] = pd.to_numeric(df["OOS"], errors="coerce").fillna(0)
-    for _ci, c in enumerate(context_cols, start=1):
+    for c in context_cols:
         df = _safe_numeric(df, c, default=0.0)
-        if _ci == 1 or _ci % 10 == 0 or _ci == len(context_cols):
-            print(f"[LOAD-PROFILE] numeric context {_ci}/{len(context_cols)} | col={c}", flush=True)
-    _load_mark("core + context numeric cleaning DONE", context_cols=len(context_cols))
 
     # Keep raw price for amount diagnostics, then use log price for model context.
     df["our_price_raw"] = df["our_price"].clip(lower=0)
@@ -996,10 +953,8 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
     # Cap heavy-tailed DPH targets using total_dph as a unified exposure scale cap.
     # This cap is applied before constructing decoder targets.
-    print("[LOAD-PROFILE] DPH cap compute/apply START", flush=True)
     dph_cap = _compute_total_dph_cap(df, q=dph_cap_q)
     df = _apply_dph_cap(df, dph_cap)
-    _load_mark("DPH cap compute/apply DONE", cap=f"{dph_cap:.6f}")
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -1009,9 +964,7 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         df[c] = df[c].clip(lower=-12, upper=12) / 12.0
 
-    print("[LOAD-PROFILE] sort ASIN+Week START", flush=True)
     df = df.sort_values(["ASIN", "Week"]).reset_index(drop=True)
-    _load_mark("sort ASIN+Week DONE")
 
     if len(holiday_cols) > 0:
         holiday_window = np.zeros(len(df), dtype=np.float32)
@@ -1024,7 +977,6 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         df["promo_t"] = 0.0
 
     df["t"] = ((df["Week"] - df["Week"].min()).dt.days // 7).astype(int)
-    _load_mark("holiday/promo/t construction DONE", holiday_cols=len(holiday_cols))
 
     data = {}
     _n_asins = int(df["ASIN"].nunique())
@@ -2315,135 +2267,105 @@ def magnitude_gap(diag_df):
 # =====================================================
 
 def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
-    """Same extreme-ASIN filtering logic, with line-level timing logs."""
+    """Memory-safe extreme-ASIN filtering.
+
+    Important: ``data_high`` is already a dedicated dataframe created by the caller,
+    so this function intentionally consumes/mutates it in place to avoid making a
+    second ~10-12 GB copy.
+    """
+    import gc
     _all_t0 = time.time()
+    df = data_high  # NO full dataframe copy
+
     print(
-        f"[EXTREME-DBG 01] ENTER | rows={len(data_high):,} | "
-        f"asins={data_high[asin_col].nunique():,} | q={q}",
+        f"[EXTREME-SAFE 01] ENTER | rows={len(df):,} | "
+        f"asins={df[asin_col].nunique():,} | q={q} | in_place=True",
         flush=True,
     )
 
     _t0 = time.time()
-    print("[EXTREME-DBG 02] data_high.copy() START", flush=True)
-    df = data_high.copy()
-    print(
-        f"[EXTREME-DBG 03] data_high.copy() DONE | elapsed={time.time()-_t0:.2f}s | "
-        f"memory_gb={df.memory_usage(deep=True).sum()/1024**3:.2f}",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print(f"[EXTREME-DBG 04] pd.to_numeric({demand_col}) START", flush=True)
+    print(f"[EXTREME-SAFE 02] clean demand column START", flush=True)
     demand_numeric = pd.to_numeric(df[demand_col], errors="coerce")
-    print(
-        f"[EXTREME-DBG 05] pd.to_numeric DONE | elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 06] fillna(0).clip(lower=0) START", flush=True)
     demand_numeric = demand_numeric.fillna(0).clip(lower=0)
-    print(
-        f"[EXTREME-DBG 07] fillna/clip DONE | elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 08] assign cleaned demand column START", flush=True)
     df[demand_col] = demand_numeric
-    print(
-        f"[EXTREME-DBG 09] assign cleaned demand column DONE | elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
+    del demand_numeric
+    gc.collect()
+    print(f"[EXTREME-SAFE 03] clean demand column DONE | elapsed={time.time()-_t0:.2f}s", flush=True)
 
     _t0 = time.time()
-    print("[EXTREME-DBG 10] positive-demand mask/filter START", flush=True)
-    pos = df.loc[df[demand_col] > 0, demand_col]
-    print(
-        f"[EXTREME-DBG 11] positive-demand filter DONE | positives={len(pos):,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    if len(pos) == 0:
-        print(
-            f"[EXTREME-DBG 12] NO POSITIVE DEMAND | total_elapsed={time.time()-_all_t0:.2f}s",
-            flush=True,
-        )
+    print(f"[EXTREME-SAFE 04] positive quantile START", flush=True)
+    positive_mask = df[demand_col].to_numpy(copy=False) > 0
+    positive_values = df.loc[positive_mask, demand_col]
+    if len(positive_values) == 0:
+        del positive_mask, positive_values
+        gc.collect()
+        print(f"[EXTREME-SAFE 05] NO POSITIVE DEMAND | elapsed={time.time()-_all_t0:.2f}s", flush=True)
         return df, pd.DataFrame(), np.nan
+    cap = float(positive_values.quantile(q))
+    del positive_mask, positive_values
+    gc.collect()
+    print(f"[EXTREME-SAFE 05] quantile DONE | cap={cap:.6f} | elapsed={time.time()-_t0:.2f}s", flush=True)
 
     _t0 = time.time()
-    print(f"[EXTREME-DBG 13] quantile({q}) START", flush=True)
-    cap = float(pos.quantile(q))
-    print(
-        f"[EXTREME-DBG 14] quantile DONE | cap={cap:.6f} | elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 15] groupby(asin).max START", flush=True)
+    print("[EXTREME-SAFE 06] groupby peak START", flush=True)
     asin_peak = (
         df.groupby(asin_col, sort=False, observed=True)[demand_col]
         .max()
         .reset_index(name="asin_max")
     )
-    print(
-        f"[EXTREME-DBG 16] groupby(asin).max DONE | groups={len(asin_peak):,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 17] identify bad ASINs START", flush=True)
     bad_mask = asin_peak["asin_max"] > cap
     bad_asins = asin_peak.loc[bad_mask, asin_col]
-    print(
-        f"[EXTREME-DBG 18] identify bad ASINs DONE | bad_asins={bad_asins.nunique():,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 19] df[asin].isin(bad_asins) START", flush=True)
-    row_bad_mask = df[asin_col].isin(bad_asins)
-    print(
-        f"[EXTREME-DBG 20] isin DONE | bad_rows={int(row_bad_mask.sum()):,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 21] create clean dataframe START", flush=True)
-    clean = df.loc[~row_bad_mask].copy()
-    print(
-        f"[EXTREME-DBG 22] create clean dataframe DONE | rows={len(clean):,} | "
-        f"asins={clean[asin_col].nunique():,} | elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-DBG 23] create removed dataframe START", flush=True)
     removed = asin_peak.loc[bad_mask].copy()
     print(
-        f"[EXTREME-DBG 24] create removed dataframe DONE | rows={len(removed):,} | "
+        f"[EXTREME-SAFE 07] groupby peak DONE | groups={len(asin_peak):,} | "
+        f"bad_asins={len(removed):,} | elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-SAFE 08] locate rows to drop START", flush=True)
+    row_bad_mask = df[asin_col].isin(bad_asins).to_numpy(dtype=bool, copy=False)
+    bad_positions = np.flatnonzero(row_bad_mask)
+    bad_index = df.index.take(bad_positions)
+    n_bad_rows = len(bad_index)
+    del row_bad_mask, bad_positions, bad_asins, bad_mask, asin_peak
+    gc.collect()
+    print(
+        f"[EXTREME-SAFE 09] rows to drop READY | bad_rows={n_bad_rows:,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print(
+        f"[EXTREME-SAFE 10] in-place drop START | rows_before={len(df):,}",
+        flush=True,
+    )
+    df.drop(index=bad_index, inplace=True)
+    del bad_index
+    gc.collect()
+    print(
+        f"[EXTREME-SAFE 11] in-place drop DONE | rows_after={len(df):,} | "
+        f"elapsed={time.time()-_t0:.2f}s",
+        flush=True,
+    )
+
+    _t0 = time.time()
+    print("[EXTREME-SAFE 12] reset index START", flush=True)
+    df.reset_index(drop=True, inplace=True)
+    gc.collect()
+    print(
+        f"[EXTREME-SAFE 13] reset index DONE | asins={df[asin_col].nunique():,} | "
         f"elapsed={time.time()-_t0:.2f}s",
         flush=True,
     )
 
     print(
-        f"\nExtreme ASIN filter (p{int(q*100)}={cap:.1f}): "
-        f"removed {bad_asins.nunique()} ASINs",
+        f"[EXTREME-SAFE 14] RETURN | cap={cap:.1f} | removed_asins={len(removed):,} | "
+        f"rows={len(df):,} | total_elapsed={time.time()-_all_t0:.2f}s",
         flush=True,
     )
-    print(
-        f"Clean ASINs: {clean[asin_col].nunique()} | Clean rows: {len(clean)}",
-        flush=True,
-    )
-    print(
-        f"[EXTREME-DBG 25] RETURN | total_elapsed={time.time()-_all_t0:.2f}s",
-        flush=True,
-    )
-    return clean, removed, cap
+    return df, removed, cap
 
 
 def run_nb_high_sparse(
@@ -2479,6 +2401,17 @@ def run_nb_high_sparse(
         prepare_data_sample(data_raw1, n_asins), zero_thresholds
     )
     data_high = data_small[data_small["zero_group"]=="high_sparse"].copy()
+
+    # data_high is now independent. Release the much larger parent dataframe before
+    # extreme filtering so the in-place filter has enough memory headroom.
+    import gc
+    del data_small
+    gc.collect()
+    print(
+        f"[MEMORY-SAFE] released data_small before extreme filtering | "
+        f"high_sparse_rows={len(data_high):,}",
+        flush=True,
+    )
 
     if remove_extreme:
         data_high, _, _ = filter_extreme_asins(data_high, q=extreme_q)
