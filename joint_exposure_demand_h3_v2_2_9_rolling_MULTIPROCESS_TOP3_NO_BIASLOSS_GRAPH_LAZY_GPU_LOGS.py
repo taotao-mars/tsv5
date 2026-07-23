@@ -4,6 +4,8 @@ print("\n" + "#" * 96, flush=True)
 print("[VERSION] v2_2_12 GRAPH_DEEP_PROFILE_MEMORY_SAFE_LAZY_WORKERS ACTIVE", flush=True)
 print("[VERSION] Expected path: base load -> graph wrapper -> lazy dataset -> DataLoader workers", flush=True)
 print("#" * 96 + "\n", flush=True)
+print("[VERSION] v2_2_13 PREGRAPH_EXTERNAL_HAT_AND_GRAPH_BOUNDARY_PROFILE ACTIVE", flush=True)
+
 # =====================================================
 # Demand v12c1-FUTURETCN-DECODER-STOPGRAD-Z
 # Based on v12c0-READHAT-NOQ:
@@ -4179,9 +4181,19 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
     These are predicted future covariates, not true future DPH.
     """
+    _ext_all_t0 = time.perf_counter()
+    print("[EXT-HAT 01] external-hat wrapper ENTER", flush=True)
+    print("[EXT-HAT 02] calling base load_real_data START", flush=True)
+
     data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3(
         data_raw=data_raw,
         dph_cap_q=dph_cap_q,
+    )
+
+    print(
+        f"[EXT-HAT 03] base load_real_data RETURNED | "
+        f"asins={len(data):,} | elapsed={(time.perf_counter()-_ext_all_t0)/60:.2f}m",
+        flush=True,
     )
 
     required = [
@@ -4193,16 +4205,37 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     ]
 
     if not all(c in data_raw.columns for c in required):
-        print("\nExternal exposure-3 columns not found. Using original future_context.")
+        print("\nExternal exposure-3 columns not found. Using original future_context.", flush=True)
+        print("[EXT-HAT 99] external-hat wrapper RETURN without hats", flush=True)
         return data, context_dim, context_cols
 
+    _t = time.perf_counter()
+    print(
+        f"[EXT-HAT 04] select/copy external columns START | rows={len(data_raw):,}",
+        flush=True,
+    )
     ext = data_raw[required].copy()
+    print(
+        f"[EXT-HAT 05] select/copy external columns DONE | "
+        f"elapsed={time.perf_counter()-_t:.2f}s",
+        flush=True,
+    )
+
+    _t = time.perf_counter()
+    print("[EXT-HAT 06] type conversion START", flush=True)
     ext["asin"] = ext["asin"].astype(str)
     ext["order_week"] = pd.to_datetime(ext["order_week"])
 
     for c in ["attn_pred_total_log", "attn_pred_buy_box_log", "attn_pred_instock_log"]:
         ext[c] = pd.to_numeric(ext[c], errors="coerce").fillna(0.0).clip(lower=0.0)
 
+    print(
+        f"[EXT-HAT 07] type conversion DONE | elapsed={time.perf_counter()-_t:.2f}s",
+        flush=True,
+    )
+
+    _t = time.perf_counter()
+    print("[EXT-HAT 08] sort/groupby START", flush=True)
     ext = (
         ext.sort_values(["asin", "order_week"])
         .groupby(["asin", "order_week"], as_index=False)
@@ -4212,6 +4245,23 @@ def load_real_data(data_raw, dph_cap_q=0.995):
             attn_pred_instock_log=("attn_pred_instock_log", "mean"),
         )
     )
+    print(
+        f"[EXT-HAT 09] sort/groupby DONE | rows={len(ext):,} | "
+        f"asins={ext['asin'].nunique():,} | elapsed={(time.perf_counter()-_t)/60:.2f}m",
+        flush=True,
+    )
+
+    _t = time.perf_counter()
+    print("[EXT-HAT 10] build ASIN lookup START", flush=True)
+    ext_by_asin = {
+        asin_key: group.reset_index(drop=True)
+        for asin_key, group in ext.groupby("asin", sort=False)
+    }
+    print(
+        f"[EXT-HAT 11] build ASIN lookup DONE | groups={len(ext_by_asin):,} | "
+        f"elapsed={time.perf_counter()-_t:.2f}s",
+        flush=True,
+    )
 
     new_cols = [
         "external_total_dph_hat_log",
@@ -4220,15 +4270,31 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     ]
 
     added_any = False
+    n_asins = len(data)
+    _attach_t0 = time.perf_counter()
+    aligned_count = 0
+    missing_count = 0
+    print(
+        f"[EXT-HAT 12] attach hats to per-ASIN future_context START | asins={n_asins:,}",
+        flush=True,
+    )
 
-    for asin, d in data.items():
-        sub = ext[ext["asin"] == str(asin)].sort_values("order_week")
+    for i, (asin, d) in enumerate(data.items(), start=1):
+        sub = ext_by_asin.get(str(asin))
 
-        if len(sub) != len(d["week"]):
-            # Align by week to be safe.
+        if sub is None:
+            missing_count += 1
+            sub = pd.DataFrame({
+                "order_week": pd.to_datetime(d["week"]),
+                "attn_pred_total_log": 0.0,
+                "attn_pred_buy_box_log": 0.0,
+                "attn_pred_instock_log": 0.0,
+            })
+        elif len(sub) != len(d["week"]):
+            aligned_count += 1
             week_df = pd.DataFrame({"order_week": pd.to_datetime(d["week"])})
             sub = week_df.merge(
-                sub.drop(columns=["asin"]),
+                sub.drop(columns=["asin"], errors="ignore"),
                 on="order_week",
                 how="left",
             )
@@ -4243,6 +4309,23 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         d["future_context"] = np.concatenate([old_fc, arr], axis=1)
         added_any = True
 
+        if i == 1 or i % 1000 == 0 or i == n_asins:
+            elapsed = time.perf_counter() - _attach_t0
+            rate = i / max(elapsed, 1e-9)
+            eta = (n_asins - i) / max(rate, 1e-9)
+            print(
+                f"[EXT-HAT 13] attach {i:,}/{n_asins:,} "
+                f"({100*i/max(n_asins,1):.1f}%) | "
+                f"elapsed={elapsed/60:.1f}m | ETA={eta/60:.1f}m | "
+                f"realigned={aligned_count:,} | missing={missing_count:,}",
+                flush=True,
+            )
+
+    print(
+        f"[EXT-HAT 14] attach hats DONE | elapsed={(time.perf_counter()-_attach_t0)/60:.2f}m",
+        flush=True,
+    )
+
     if added_any:
         context_cols = context_cols + new_cols
         context_dim = len(context_cols)
@@ -4253,6 +4336,11 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         print("Added context cols:", new_cols)
         print("New context dim:", context_dim)
 
+    print(
+        f"[EXT-HAT 15] external-hat wrapper RETURN | "
+        f"total_elapsed={(time.perf_counter()-_ext_all_t0)/60:.2f}m",
+        flush=True,
+    )
     return data, context_dim, context_cols
 
 
@@ -4919,31 +5007,72 @@ def _reorder_future_context_keep_hats_last(data, context_cols):
 
 def load_real_data(data_raw, dph_cap_q=0.995):
     _wrapper_t0 = time.perf_counter()
-    print("[PROFILE-WRAPPER] graph-context wrapper ENTERED", flush=True)
+    print("[PROFILE-WRAPPER 01] graph-context wrapper ENTERED", flush=True)
     print(
-        f"[PROFILE-WRAPPER] active base loader={getattr(_ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT, '__name__', type(_ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT).__name__)}",
+        f"[PROFILE-WRAPPER 02] active base loader="
+        f"{getattr(_ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT, '__name__', type(_ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT).__name__)}",
         flush=True,
     )
-    data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT(data_raw, dph_cap_q=dph_cap_q)
+    print("[PROFILE-WRAPPER 03] CALL pre-graph loader START", flush=True)
+
+    _pregraph_result = _ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT(
+        data_raw,
+        dph_cap_q=dph_cap_q,
+    )
+
     print(
-        f"[PROFILE-WRAPPER] base load_real_data RETURNED | elapsed={(time.perf_counter()-_wrapper_t0)/60:.2f}m",
+        f"[PROFILE-WRAPPER 04] pre-graph loader RETURNED | "
+        f"elapsed={(time.perf_counter()-_wrapper_t0)/60:.2f}m",
         flush=True,
     )
+    _unpack_t0 = time.perf_counter()
+    print("[PROFILE-WRAPPER 05] unpack pre-graph tuple START", flush=True)
+    data, context_dim, context_cols = _pregraph_result
+    print(
+        f"[PROFILE-WRAPPER 06] unpack pre-graph tuple DONE | "
+        f"asins={len(data):,} | context_dim={context_dim} | "
+        f"elapsed={time.perf_counter()-_unpack_t0:.6f}s",
+        flush=True,
+    )
+    del _pregraph_result
+    print("[PROFILE-WRAPPER 07] GRAPH PIPELINE ENTER", flush=True)
+
     _graph_t0 = time.perf_counter()
-    print("[PROFILE-GRAPH] graph preprocessing START", flush=True)
-    data, context_dim, context_cols = _graph_add_context_cols_to_data(data, context_cols, data_raw=data_raw)
+    print("[PROFILE-GRAPH 01] graph preprocessing START", flush=True)
+    data, context_dim, context_cols = _graph_add_context_cols_to_data(
+        data,
+        context_cols,
+        data_raw=data_raw,
+    )
     print(
-        f"[PROFILE-GRAPH] graph preprocessing DONE | elapsed={(time.perf_counter()-_graph_t0)/60:.2f}m",
+        f"[PROFILE-GRAPH 02] graph preprocessing DONE | "
+        f"elapsed={(time.perf_counter()-_graph_t0)/60:.2f}m",
         flush=True,
     )
-    data, context_dim, context_cols = _reorder_future_context_keep_hats_last(data, context_cols)
+
+    _reorder_t0 = time.perf_counter()
+    print("[PROFILE-GRAPH 03] reorder future_context START", flush=True)
+    data, context_dim, context_cols = _reorder_future_context_keep_hats_last(
+        data,
+        context_cols,
+    )
+    print(
+        f"[PROFILE-GRAPH 04] reorder future_context DONE | "
+        f"elapsed={time.perf_counter()-_reorder_t0:.6f}s",
+        flush=True,
+    )
+
     print("\n" + "=" * 100)
     print("PACKAGE-AWARE RELATION GRAPH FEATURES ADDED TO DEMAND FUTURE_CONTEXT")
     print("Graph cols:", GRAPH_CONTEXT_COLS)
     print("External exposure hats kept as last 3 columns:", all(c in context_cols[-3:] for c in EXTERNAL_HAT_COLS))
     print("New context dim:", context_dim)
     print("=" * 100)
-    print(f"[STAGE] graph-context wrapper DONE | {(time.perf_counter()-_wrapper_t0)/60:.2f} min", flush=True)
+    print(
+        f"[PROFILE-WRAPPER 08] graph-context wrapper RETURN | "
+        f"total_elapsed={(time.perf_counter()-_wrapper_t0)/60:.2f}m",
+        flush=True,
+    )
     return data, context_dim, context_cols
 
 
