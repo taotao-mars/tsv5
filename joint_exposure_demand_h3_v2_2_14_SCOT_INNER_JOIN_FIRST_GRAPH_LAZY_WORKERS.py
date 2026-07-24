@@ -1,4 +1,4 @@
-print("[VERSION] v2_2_9 GRAPH_LAZY_GPU_LOGS", flush=True)
+# PROFILE VERSION\nprint("[VERSION] v2_2_9 GRAPH_LAZY_GPU_LOGS", flush=True)
 
 print("\n" + "#" * 96, flush=True)
 print("[VERSION] v2_2_12 GRAPH_DEEP_PROFILE_MEMORY_SAFE_LAZY_WORKERS ACTIVE", flush=True)
