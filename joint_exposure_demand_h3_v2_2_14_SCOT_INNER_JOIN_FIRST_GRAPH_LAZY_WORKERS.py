@@ -5,6 +5,7 @@ print("[VERSION] v2_2_12 GRAPH_DEEP_PROFILE_MEMORY_SAFE_LAZY_WORKERS ACTIVE", fl
 print("[VERSION] Expected path: base load -> graph wrapper -> lazy dataset -> DataLoader workers", flush=True)
 print("#" * 96 + "\n", flush=True)
 print("[VERSION] v2_2_13 PREGRAPH_EXTERNAL_HAT_AND_GRAPH_BOUNDARY_PROFILE ACTIVE", flush=True)
+print("[VERSION] v2_2_15 CHRIS ASIN COHORT + SCOT INNER JOIN FIRST ACTIVE", flush=True)
 
 # =====================================================
 # Demand v12c1-FUTURETCN-DECODER-STOPGRAD-Z
@@ -289,6 +290,34 @@ def weekly_error_check(df, cols, cols_type):
 
 
 # =====================================================
+# STEP 0. Chris ASIN cohort (loaded once)
+# =====================================================
+CHRIS_DF_PATH = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
+
+if not os.path.exists(CHRIS_DF_PATH):
+    raise FileNotFoundError(
+        f"Chris ASIN cohort file not found: {CHRIS_DF_PATH}. "
+        "Place the CSV in the current working directory."
+    )
+
+_chris_df = pd.read_csv(CHRIS_DF_PATH, usecols=["asin"])
+CHRIS_ASIN_SET = set(
+    _chris_df["asin"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .unique()
+)
+del _chris_df
+
+print(
+    f"[STEP0-CHRIS] loaded {len(CHRIS_ASIN_SET):,} unique ASINs "
+    f"from {CHRIS_DF_PATH}",
+    flush=True,
+)
+
+
+# =====================================================
 # 0. Sampling
 # =====================================================
 
@@ -314,17 +343,15 @@ def prepare_data_from_sample_scot_intersection(
     seed=42,
 ):
     """
-    INNER JOIN WITH SCOT FIRST, then optionally sample from the eligible cohort.
+    INNER JOIN raw feature ASINs with both SCOT and the Chris ASIN cohort first,
+    then optionally sample from the eligible cohort.
 
-    This is intentionally ASIN-level only. Joining on (asin, order_week) here would
-    remove historical weeks needed by the 52-week encoder. Week-level alignment is
-    still performed later for final SCOT evaluation.
-
-    n_asins=None means use every ASIN in the raw-SCOT intersection.
+    This remains ASIN-level only so the full historical sequence is preserved.
+    n_asins=None means use every ASIN in raw ∩ SCOT ∩ Chris.
     """
     t0 = time.time()
     print("\n" + "=" * 80, flush=True)
-    print("SCOT INNER JOIN FIRST — ASIN COHORT", flush=True)
+    print("SCOT + CHRIS INNER JOIN FIRST — ASIN COHORT", flush=True)
     print("=" * 80, flush=True)
 
     # Build the lightweight SCOT key set first. Avoid copying the full raw frame
@@ -338,17 +365,23 @@ def prepare_data_from_sample_scot_intersection(
     )
     scot_asin_set = set(scot_asins)
 
+    # Final eligible cohort for this cut: SCOT ∩ Chris.
+    allowed_asin_set = scot_asin_set & CHRIS_ASIN_SET
+
     raw_asin_key = data_raw1["asin"].astype(str).str.strip()
     raw_asin_count = int(raw_asin_key.nunique(dropna=True))
 
     print(
-        f"[SCOT-INNER 01] key sets ready | raw_asins={raw_asin_count:,} | "
-        f"scot_asins={len(scot_asin_set):,} | elapsed={time.time()-t0:.2f}s",
+        f"[SCOT-CHRIS-INNER 01] key sets ready | raw_asins={raw_asin_count:,} | "
+        f"scot_asins={len(scot_asin_set):,} | "
+        f"chris_asins={len(CHRIS_ASIN_SET):,} | "
+        f"scot_x_chris={len(allowed_asin_set):,} | "
+        f"elapsed={time.time()-t0:.2f}s",
         flush=True,
     )
 
     t_filter = time.time()
-    eligible_mask = raw_asin_key.isin(scot_asin_set)
+    eligible_mask = raw_asin_key.isin(allowed_asin_set)
     eligible_rows = int(eligible_mask.sum())
 
     # Copy only the SCOT-eligible rows. This is the first large dataframe copy.
@@ -358,7 +391,7 @@ def prepare_data_from_sample_scot_intersection(
 
     eligible_asins = eligible["asin"].dropna().unique()
     print(
-        f"[SCOT-INNER 02] raw x SCOT ASIN inner join DONE | "
+        f"[SCOT-CHRIS-INNER 02] raw x SCOT x Chris ASIN inner join DONE | "
         f"rows={eligible_rows:,} | asins={len(eligible_asins):,} | "
         f"removed_asins={raw_asin_count-len(eligible_asins):,} | "
         f"elapsed={time.time()-t_filter:.2f}s",
@@ -384,7 +417,7 @@ def prepare_data_from_sample_scot_intersection(
         del eligible
         gc.collect()
         print(
-            f"[SCOT-INNER 03] post-join sampling DONE | "
+            f"[SCOT-CHRIS-INNER 03] post-join sampling DONE | "
             f"selected_asins={len(selected_set):,} | rows={len(data_small):,} | "
             f"elapsed={time.time()-t_sample:.2f}s",
             flush=True,
@@ -394,7 +427,7 @@ def prepare_data_from_sample_scot_intersection(
     intersect_asin_df = pd.DataFrame({"asin": sorted(selected_set)})
 
     print(
-        f"[SCOT-INNER 04] cohort READY | rows={len(data_small):,} | "
+        f"[SCOT-CHRIS-INNER 04] cohort READY | rows={len(data_small):,} | "
         f"asins={data_small['asin'].nunique():,} | "
         f"total_elapsed={time.time()-t0:.2f}s",
         flush=True,
